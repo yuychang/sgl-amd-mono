@@ -672,6 +672,15 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
             "the block-write row does not hold the updated prefix",
         )
 
+    def test_block_write_past_the_bank_is_refused(self):
+        """``write_idx`` is the next bank row. A bank of that many rows is one
+        short, and the store would run off the end into the next allocation."""
+        row = NVB
+        case = K1Case(self.device, num_acc=QLEN, write_idx=row)
+        case.blocks = case.blocks[:, :row].contiguous()
+        with self.assertRaises(AssertionError):
+            case.run()
+
 
 if __name__ == "__main__":
     unittest.main()

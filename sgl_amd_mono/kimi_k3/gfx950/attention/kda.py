@@ -968,7 +968,15 @@ def kda_pre(
     below ``TAG_SLOTS``. ``w_in`` is in ``key.wfmt``, with ``w_in_scale`` its
     fp32 scale a row when that is FP8. With ``key.ring_len``, ``ring`` is the
     layer's ReplaySSM ring as (raw k, raw v, log-decay gate, beta), each
-    [slots, 12, ring_len, 128] (beta without the 128): bf16, bf16, fp32, fp32."""
+    [slots, 12, ring_len, 128] (beta without the 128): bf16, bf16, fp32, fp32.
+    ``blocks`` is [tokens, rows, hidden]; a block-write layer stores the
+    updated prefix at row ``write_idx``, so the bank has to be longer than
+    that index. The store is not bounds-checked."""
+    if key.write_idx >= 0:
+        assert blocks.size(1) > key.write_idx, (
+            f"the block-write row is {key.write_idx}, past a bank of "
+            f"{blocks.size(1)} rows {tuple(blocks.shape)}"
+        )
     if key.wfmt == W_BF16:
         assert w_in.shape == (NPROJ, HIDDEN) and w_in.dtype == torch.bfloat16
         assert w_in_scale is None

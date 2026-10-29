@@ -395,6 +395,19 @@ def _build(model, hf_config, ctx):
     return _Built(model, runner, layers, batches)
 
 
+def _k1_bank_rows(key) -> int:
+    """Bank rows K1's warmup tensor must hold.
+
+    ``nblocks`` counts the rows the seam reads. A block-write layer stores the
+    updated prefix at ``write_idx``, and that index is the count of rows
+    already valid, so it sits one past a tensor sized to ``nblocks``. The store
+    is not bounds-checked: a short bank overwrites the next allocation.
+    """
+    if key.write_idx >= 0:
+        return max(key.nblocks, key.write_idx + 1)
+    return key.nblocks
+
+
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
     """Launch every layer once at this width, before any graph capture."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -417,7 +430,10 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
         # waits pair up in the same order here as there.
         if packed.k1 is not None:
             k1_mod.warmup(
-                runner, packed.k1, runner.prefix[:rows], bank(packed.k1.key.nblocks)
+                runner,
+                packed.k1,
+                runner.prefix[:rows],
+                bank(_k1_bank_rows(packed.k1.key)),
             )
         _k2_launch(
             runner, packed, core, runner.prefix[:rows], bank(packed.key.nblocks), out
