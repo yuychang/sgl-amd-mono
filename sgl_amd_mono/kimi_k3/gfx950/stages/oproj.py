@@ -8,7 +8,9 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``:
     gemv CTAs 56 ..   o_proj (448 x 16 rows, K = 1536 local): bf16 GEMV of the
                       core rows (plain loads: the previous launch wrote them) ->
                       bf16 partial -> pushed to every rank's AR region (system
-                      scope, this rank's slot)
+                      scope, this rank's slot). An FP8 o_proj (``O_FP8*``) is
+                      widened to bf16 in registers and its per-row scale
+                      applied to the fp32 sum, before the bf16 rounding
     attn CTAs 0 .. 55 per 128 columns: the 8 ranks' partials summed in rank
                       order (fp32 -> bf16: the custom all-reduce's result) ->
                       LDS delta; then K1's AttnRes stages with the MLP's weights:
@@ -30,6 +32,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from sgl_amd_mono.common.ops import (
     CM_NT,
     bf16_round,
+    fp8_to_bf16x8,
     ld_i32,
     mfma_bf16,
     peer_bases,
@@ -78,6 +81,12 @@ GEMV0 = NA  # the first gemv CTA
 GEMV_N = BLOCKS - NA  # 200
 TL_POINTS = 6  # start, gemv, pushed, reduced, slice/gate, mix
 
+# o_proj's weight formats (``c["ofmt"]``): bf16 [7168, 1536] row-major; a
+# per-channel FP8 one with an fp32 scale a row, row-major or in AITER's (16, 16)
+# preshuffle -- the B operand of its FP8 GEMM, which SGLang stores whenever
+# that GEMM runs (``use_aiter_bpreshuffle_gemm``). FP8 halves o_proj's bytes.
+O_BF16, O_FP8, O_FP8_SHUFFLED = 0, 1, 2
+
 _STREAM = fx.Stream(None)
 
 
@@ -115,7 +124,10 @@ def scratch_bytes(key: AttnPostBuild) -> int:
 
 def o_loads(c, rg):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
-    64 B of its row a chunk."""
+    32 of its row's elements a chunk, 8 at k = 8 g + 32 q, q < 4 (``stage_o``
+    reads the same k from LDS). bf16: 4 x 16 B of the row; FP8: 4 x 8 B."""
+    if c.get("ofmt", O_BF16) != O_BF16:
+        return o_loads_fp8(c, rg)
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
@@ -139,6 +151,62 @@ def o_loads(c, rg):
             ]
         )
     return out
+
+
+def o_fp8_byte(c, rg, ch, q):
+    """The byte of a lane's 8 FP8 elements (row 16 rg + lane % 16, k = 128 ch +
+    32 q + 8 g). AITER's (16, 16) preshuffle of a byte weight [N, K] is
+    [N / 16][K / 32][2][16 rows][16 B], so those 8 bytes stay contiguous."""
+    lane = c["lane"]
+    r, g = lane % ROWS, lane // ROWS
+    if c["ofmt"] == O_FP8_SHUFFLED:
+        tile = rg * (OK // 32) + ch * 4 + q
+        return tile * 512 + (g // 2) * 256 + r * 16 + (g % 2) * 8
+    return (rg * ROWS + r) * OK + ch * 128 + q * 32 + g * 8
+
+
+def o_loads_fp8(c, rg):
+    """``o_loads`` for an FP8 o_proj: per chunk and q, the lane's two dwords."""
+    wave = c["wave"]
+    r_w = rsrc(c["args"]["w_o"])
+    out = []
+    for i in range(2):
+        ch = fx.min(wave + WAVES * i, OKCH - 1)
+        out.append(
+            [
+                fx.Vector(
+                    bo.buffer_load(
+                        r_w,
+                        o_fp8_byte(c, rg, ch, q) // 4,
+                        vec_width=2,
+                        dtype=T.i32,
+                        cache_modifier=CM_NT,
+                    )
+                )
+                for q in range(4)
+            ]
+        )
+    return out
+
+
+def o_operand(c, w):
+    """A lane's 8 o_proj values as the MFMA's bf16 operand. E4M3 widens to
+    bf16 exactly, so an FP8 weight loses nothing here."""
+    if c.get("ofmt", O_BF16) == O_BF16:
+        return w.bitcast(fx.BFloat16)
+    return fp8_to_bf16x8(w[0], w[1])
+
+
+def o_scaled(c, row, v0, v1):
+    """Rows ``row`` and ``row + 1``'s fp32 sums; an FP8 o_proj's per-channel
+    scale applied, as its GEMM applies it. A plain function: under a traced
+    ``if``, FlyDSL would carry ``c`` through the branch."""
+    if c.get("ofmt", O_BF16) == O_BF16:
+        return v0, v1
+    sc = fx.Vector(
+        bo.buffer_load(rsrc(c["args"]["w_os"]), row, vec_width=2, dtype=T.f32)
+    )
+    return v0 * sc[0], v1 * sc[1]
 
 
 @flyc.jit
@@ -182,16 +250,19 @@ def stage_o(c, rg, ops):
             xb = fx.Vector.from_elements(
                 [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
             )
-            acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
-            )
+            acc = mfma_bf16(o_operand(c, ops[i][q]), xb.bitcast(fx.BFloat16), acc)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if tid < s * (ROWS // 2):
         tt = tid // (ROWS // 2)
         rp = tid % (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0, v1 = o_scaled(
+            c,
+            rg * ROWS + 2 * rp,
+            row_sum(red, 2 * rp, tt),
+            row_sum(red, 2 * rp + 1, tt),
+        )
+        v0, v1 = bf16_round(v0), bf16_round(v1)
         at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
         for p in range_constexpr(TP):
             c["put_bf"](c["ar_peer"][p], at, [v0, v1])

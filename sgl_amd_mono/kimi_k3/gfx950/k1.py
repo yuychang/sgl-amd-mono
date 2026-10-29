@@ -64,6 +64,12 @@ SGLANG_READS = {
     # the KDA layer's speculative state. Taken from the backend here rather
     # than through an accessor on it, the way glm53_flash reads its own.
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    # the server configuration K1's state handling rules out
+    "srt/runtime_context.py": ("get_exec",),
+    "srt/arg_groups/fields/exec_.py": (
+        "enable_linear_replayssm_spec",
+        "mamba_ssm_dtype",
+    ),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "linear_attn_backend",
         "req_to_token_pool",
@@ -87,6 +93,7 @@ SGLANG_READS = {
     "srt/models/kimi_k3.py": (
         "use_full_rank_gate",
         "_qkvgbfa_layer",
+        "_qkvgbfa_in_qkvg_proj",
         "qkv_conv1d",
         "f_b_proj",
         "A_log",
@@ -135,6 +142,35 @@ def _is_kda_layer(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d")
 
 
+def _config_reasons() -> list[str]:
+    """What the server's configuration rules out for every KDA layer at once.
+
+    K1 stages its recurrence in the fp32 ``intermediate_ssm`` scratch that
+    SGLang's verify commits from. ReplaySSM's spec verify commits from its own
+    ring instead, so a step K1 ran would commit a state K1 never wrote. A bf16
+    pool is refused per step anyway; saying it here keeps that out of every
+    step's prepare.
+    """
+    from sglang.srt.runtime_context import get_exec
+
+    try:
+        mamba = get_exec().mamba
+    except ValueError:  # not published: no server, nothing to rule out
+        return []
+    reasons = []
+    if getattr(mamba, "enable_linear_replayssm_spec", False):
+        reasons.append(
+            "ReplaySSM spec verify (--enable-linear-replayssm-spec) commits the "
+            "verify round from its ring, not the intermediate_ssm K1 writes"
+        )
+    dtype = getattr(mamba, "mamba_ssm_dtype", None)
+    if dtype not in (None, "float32", torch.float32):
+        reasons.append(
+            f"the recurrent state is {dtype} (--mamba-ssm-dtype); K1 takes float32"
+        )
+    return reasons
+
+
 def _unsupported_reasons(layer) -> list[str]:
     """Why K1 cannot take this layer, fail-loud at build rather than per step."""
     attn = layer.self_attn
@@ -152,11 +188,21 @@ def _unsupported_reasons(layer) -> list[str]:
             "the KDA gate is not full-rank, so there is no wide projection to "
             "extend (linear_attn_config.use_full_rank_gate)"
         )
+    elif getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
+        reasons.append(
+            "the KDA in-projection is Quark FP8, merged into fused_qkvg_proj; "
+            "K1 reads a bf16 one"
+        )
     elif getattr(attn, "_qkvgbfa_layer", None) is None:
         reasons.append(
             "the KDA in-projection is not merged "
-            "(SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0, or attention weights this "
+            "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, or attention weights this "
             "merge may not concatenate)"
+        )
+    elif attn._qkvgbfa_layer.weight.dtype != torch.bfloat16:
+        reasons.append(
+            f"the merged KDA in-projection is {attn._qkvgbfa_layer.weight.dtype}, "
+            "not bf16"
         )
     conv = getattr(attn, "qkv_conv1d", None)
     if conv is None or conv.weight.dim() != 3 or conv.weight.shape[1] != 1:
@@ -173,7 +219,7 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
 
     if not _is_kda_layer(layer):
         return None  # a full-attention layer, not a refusal
-    reasons = _unsupported_reasons(layer)
+    reasons = _config_reasons() + _unsupported_reasons(layer)
     if reasons:
         # Said once: a KDA layer K1 could not take is a configuration fact the
         # log has to carry, or K1 reads as built and unhelpful.

@@ -93,6 +93,7 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
+    ofmt: int = k2a.O_BF16  # o_proj's weight format; see stages.oproj.O_BF16
 
 
 def peer_layout(s):
@@ -206,13 +207,14 @@ def build(key: K2Build):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
-        f"_t{int(key.timeline)}"
+        f"_t{int(key.timeline)}_o{key.ofmt}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
         core: Int64,
         w_o: Int64,
+        w_os: Int64,
         prefix: Int64,
         blocks: Int64,
         blk_sm: Int32,
@@ -300,6 +302,7 @@ def build(key: K2Build):
                 "ln_eps": key.ln_eps,
                 "xp": key.xp,
                 "guint": key.guint,
+                "ofmt": key.ofmt,
                 "lazy_inter": True,
                 "put": mb.put,
                 "put_bf": mb.put_bf,
@@ -334,6 +337,7 @@ def build(key: K2Build):
                 "args": {
                     "core": core,
                     "w_o": w_o,
+                    "w_os": w_os,
                     "prefix": prefix,
                     "blocks": blocks,
                     "blk_sm": blk_sm,
@@ -461,6 +465,7 @@ def build(key: K2Build):
     def launch(
         core: Int64,
         w_o: Int64,
+        w_os: Int64,
         prefix: Int64,
         blocks: Int64,
         blk_sm: Int32,
@@ -492,6 +497,7 @@ def build(key: K2Build):
         k2(
             core,
             w_o,
+            w_os,
             prefix,
             blocks,
             blk_sm,
@@ -558,19 +564,34 @@ def k2_launch(
     epoch,
     layer,
     tl=None,
+    w_os=None,
 ):
     """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
-    place, ``out`` the MoE output [S, 7168]; MoE weights as ``moe``."""
+    place, ``out`` the MoE output [S, 7168]; MoE weights as ``moe``. ``w_o`` is
+    o_proj's [7168, 1536] storage in ``key.ofmt``, and ``w_os`` its fp32 scale a
+    row when that is FP8."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
+        and w_o.is_contiguous()
         and core.is_contiguous()
         and prefix.is_contiguous()
     )
+    if key.ofmt == k2a.O_BF16:
+        assert w_o.dtype == torch.bfloat16 and w_os is None
+    else:
+        assert w_o.dtype == torch.float8_e4m3fn, w_o.dtype
+        assert (
+            w_os is not None
+            and w_os.dtype == torch.float32
+            and w_os.numel() == HIDDEN
+            and w_os.is_contiguous()
+        )
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
     f = build(key)
     f(
         core.data_ptr(),
         w_o.data_ptr(),
+        ptr(w_os),
         prefix.data_ptr(),
         blocks.data_ptr(),
         blocks.stride(0),

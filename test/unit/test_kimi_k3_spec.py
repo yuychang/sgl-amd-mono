@@ -118,7 +118,7 @@ def test_max_blocks_matches_the_reference_config():
     assert -(-last // block) + int(last % block == 0) == MAX_BLOCKS
 
 
-def _fake_layer(*, gate=True, kda=False):
+def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384):
     """A covered layer as model_disable_reasons reads it, everything passing."""
     import torch
 
@@ -128,14 +128,15 @@ def _fake_layer(*, gate=True, kda=False):
         )
 
     attn = SimpleNamespace(
-        o_proj=lin(HF_CONFIG["hidden_size"], 1536),
+        o_proj=o_proj or lin(HF_CONFIG["hidden_size"], 1536),
         forward_pre_o_proj=lambda **kw: None,
     )
     if not kda:  # only the MLA layers carry the gate
         attn.use_output_gate = gate
+    e, lat = HF_CONFIG["num_experts"], HF_CONFIG["routed_expert_hidden_size"]
     experts = SimpleNamespace(
-        w13_weight=SimpleNamespace(is_shuffled=True),
-        w2_weight=SimpleNamespace(is_shuffled=True),
+        w13_weight=SimpleNamespace(is_shuffled=True, shape=(e, 2 * ri, lat // 2)),
+        w2_weight=SimpleNamespace(is_shuffled=True, shape=(e, lat, ri // 2)),
     )
     up = SimpleNamespace(
         weight=torch.zeros(HF_CONFIG["hidden_size"], 8, dtype=torch.bfloat16)
@@ -172,6 +173,74 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     # so it cannot carry this: for MLA the split rides on the gate's wrapper.
     reasons = _reasons(monkeypatch, _fake_layer(gate=False))
     assert any("output gate" in r for r in reasons), reasons
+
+
+def _fp8_o_proj(*, quark=True):
+    """o_proj as SGLang leaves a Quark per-channel FP8 one: the [out, in]
+    storage transposed for its GEMM, an fp32 scale a row."""
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    hidden = HF_CONFIG["hidden_size"]
+    scheme = QuarkW8A8Fp8(
+        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+    )
+    return SimpleNamespace(
+        weight=torch.zeros(hidden, 1536, dtype=torch.float8_e4m3fn).t(),
+        weight_scale=torch.ones(hidden, 1, dtype=torch.float32),
+        scheme=scheme if quark else object(),
+        bias=None,
+    )
+
+
+def test_a_quark_fp8_o_proj_passes(monkeypatch):
+    assert _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj())) == []
+
+
+def test_an_fp8_o_proj_outside_quark_is_refused(monkeypatch):
+    reasons = _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj(quark=False)))
+    assert any("Quark per-channel FP8" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize("shuffled", [True, False])
+def test_the_fp8_o_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffled):
+    # SGLang preshuffles the FP8 weight exactly when its own predicate says so;
+    # the launch must read the same layout, or it reads the bytes in a wrong order.
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: shuffled)
+    fmt, storage, scale = k3._o_proj_operands(_fp8_o_proj())
+    assert fmt == (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8)
+    assert storage.is_contiguous() and tuple(storage.shape) == (
+        HF_CONFIG["hidden_size"],
+        1536,
+    )
+    assert tuple(scale.shape) == (HF_CONFIG["hidden_size"],)
+
+
+def test_padded_experts_are_refused(monkeypatch):
+    # Without SGLANG_OPT_HIP_K3_AITER the intermediate is padded to 512.
+    reasons = _reasons(monkeypatch, _fake_layer(ri=512))
+    assert any("padded intermediate" in r for r in reasons), reasons
+
+
+def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
+    # AITER_SITUV2_A4W4's preshuffle is byte for byte the launch's gate_up=False one.
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
+    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    reasons = k3._config_disable_reasons(None, K3)
+    assert not any("interleaved" in r or "K3_AITER" in r for r in reasons), reasons
+
+
+def test_the_k3_aiter_switch_is_read_under_its_new_name(monkeypatch):
+    monkeypatch.delenv("SGLANG_AITER_K3_OPT", raising=False)
+    monkeypatch.delenv("SGLANG_OPT_HIP_K3_AITER", raising=False)
+    assert any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
+    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    assert not any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
 
 
 def test_the_guard_flags_sit_past_every_width(monkeypatch):

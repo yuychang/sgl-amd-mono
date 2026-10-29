@@ -11,6 +11,11 @@ The MoE is compared on the seam output the kernel itself produced, read back
 out of its scratch. A wrong seam then cannot hide behind a MoE that agrees
 with whatever it was given.
 
+``--o-proj`` picks o_proj's format: bf16, or a per-channel FP8 one row-major
+(``fp8``) or in AITER's (16, 16) preshuffle (``fp8-shuffled``), the layout
+SGLang stores a Quark FP8 o_proj in for its GEMM. The FP8 reference multiplies
+the same E4M3 values in fp32 and scales each row, so the bound is the bf16 one.
+
 Both prefix modes run. A plain layer accumulates into the prefix. A block-write
 layer restarts it at the attention output. The control at the end of the file
 is why that matters. Without it, a kernel that ignored the prefix would match
@@ -44,7 +49,7 @@ from sgl_amd_mono.kimi_k3.spec import NUMERICS
 DEADLINE_S = 30.0
 
 
-def seam_reference(core, w_o, prefix_in, blocks, nvb, w, *, reset):
+def seam_reference(core, w_o, prefix_in, blocks, nvb, w, *, reset, o_scale=None):
     """o_proj, its all-reduce and the MLP attention-residual seam, in torch.
 
     This mirrors AttnResidual's eager path. The sources are the ``nvb`` banked
@@ -54,7 +59,11 @@ def seam_reference(core, w_o, prefix_in, blocks, nvb, w, *, reset):
     """
     import torch.nn.functional as F
 
-    attn = all_reduce_fp32(F.linear(core, w_o)).float()
+    if o_scale is None:
+        partial = F.linear(core, w_o)
+    else:  # an FP8 o_proj: the E4M3 values in fp32, each row's sum scaled
+        partial = (F.linear(core.float(), w_o.float()) * o_scale).to(BF)
+    attn = all_reduce_fp32(partial).float()
     # A block-write layer restarts the prefix at the attention output.
     prefix = (attn if reset else prefix_in.float() + attn).to(BF)
     rows = torch.cat([blocks[:, :nvb, :], prefix.unsqueeze(1)], dim=1)
@@ -89,6 +98,17 @@ def layer_weights(rank, device):
     }
 
 
+def fp8_o_proj(w_o, shuffled):
+    """o_proj quantized per row to E4M3 as Quark's per-channel FP8 is ->
+    (the values, their storage in the launch's layout, the fp32 scale a row)."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    scale = w_o.float().abs().amax(dim=1).clamp(min=1e-12) / 448.0
+    q = (w_o.float() / scale[:, None]).to(torch.float8_e4m3fn)
+    storage = shuffle_weight(q.clone(), (16, 16)) if shuffled else q
+    return q, storage.contiguous(), scale.contiguous()
+
+
 def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
     """One layer launch -> (out, the updated prefix, the build key the caller
     reads the seam output back with)."""
@@ -99,6 +119,7 @@ def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
         out_eps=w["out_eps"],
         reset=reset,
         guint=guint,
+        ofmt=w["ofmt"],
     )
     # The kernel updates the prefix in place, so hand it a copy and keep the
     # input for the reference.
@@ -107,7 +128,8 @@ def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
     k2.k2_launch(
         key,
         core=w["core"],
-        w_o=w["w_o"],
+        w_o=w["w_o_store"],
+        w_os=w["w_os"],
         prefix=prefix,
         blocks=w["blocks"],
         ares_nw=w["ares_nw"],
@@ -137,6 +159,7 @@ def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=50)
+    ap.add_argument("--o-proj", choices=("bf16", "fp8", "fp8-shuffled"), default="bf16")
     args = ap.parse_args()
 
     rank, dev, cpu = setup()
@@ -166,8 +189,22 @@ def main():
         dtype=torch.uint8,
         device=dev,
     )
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
     w = moe_weights(rank, dev, guint=False)
     w.update(layer_weights(rank, dev))
+    if args.o_proj == "bf16":
+        w.update(ofmt=oproj.O_BF16, w_o_store=w["w_o"], w_os=None, o_scale=None)
+    else:
+        shuffled = args.o_proj == "fp8-shuffled"
+        q, store, scale = fp8_o_proj(w["w_o"], shuffled)
+        w.update(
+            ofmt=oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8,
+            w_o=q,
+            w_o_store=store,
+            w_os=scale,
+            o_scale=scale,
+        )
 
     fails, seen, first = [], {}, {}
     for tag, reset in (("accumulate", False), ("reset", True)):
@@ -182,8 +219,9 @@ def main():
         xrow = scratch[off : off + nbytes].view(BF).view(ROWS, HIDDEN).clone()
         out, prefix = out.clone(), prefix.clone()
         ref_prefix, ref_x = seam_reference(
-            w["core"], w["w_o"], w["prefix"], w["blocks"], NVB, w, reset=reset
-        )
+            w["core"], w["w_o"], w["prefix"], w["blocks"], NVB, w, reset=reset,
+            o_scale=w["o_scale"],
+        )  # fmt: skip
         ref_moe = moe_reference(xrow, w, rank)
         gathered = [torch.empty_like(out) for _ in range(TP)]
         dist.all_gather(gathered, out.contiguous())
@@ -197,7 +235,7 @@ def main():
         }
         if rank == 0:
             print(
-                f"{tag}: prefix cos {cos(prefix, ref_prefix):.6f}  "
+                f"{args.o_proj} {tag}: prefix cos {cos(prefix, ref_prefix):.6f}  "
                 f"x cos {cos(xrow, ref_x):.6f}  "
                 f"out cos {cos(out, ref_moe):.6f} rel {rel(out, ref_moe):.4g}",
                 flush=True,

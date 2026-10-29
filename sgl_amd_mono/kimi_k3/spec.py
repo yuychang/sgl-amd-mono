@@ -26,9 +26,12 @@ the full-attention layers reach that point the same way. At TP8 both stop at a
 kind.
 
 The kernels read SGLang's weights in place. The dense weights are read as bf16
-in their checkpoint layout. The experts are read in whichever MXFP4 layout
-``Mxfp4MoEMethod`` left behind. There is no prepared-weight copy, so the KV
-cache budget pays nothing.
+in their checkpoint layout. o_proj may instead be a Quark per-channel FP8
+weight, read as SGLang stored it for its FP8 GEMM (``_o_proj_operands``). The
+experts are read in whichever MXFP4 layout AITER's MoE was given: gate / up
+interleaved (A8W4, the A16W4 default) or separated (``AITER_SITUV2_A4W4``),
+whose preshuffle is byte for byte the one the launch was written for. There is
+no prepared-weight copy, so the KV cache budget pays nothing.
 
 Two further differences from DeepSeek-V4.1 are deliberate. Each is argued in
 the module that holds it. The mailbox epoch is bumped by the host, not advanced
@@ -88,8 +91,20 @@ SGLANG_READS = {
         "NumericsKind",
         "Requirements",
     ),
-    # the MXFP4 expert layout the launch reads, as Mxfp4MoEMethod chose it
+    # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
+    # the K3 AITER switch the expert layout depends on; its pre-rename name
+    # is read where the field does not exist yet
+    "srt/environ.py": ("envs", "SGLANG_OPT_HIP_K3_AITER"),
+    # a Quark per-channel FP8 o_proj, and whether SGLang preshuffled it
+    "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
+        "QuarkW8A8Fp8",
+        "weight_qscheme",
+    ),
+    "srt/layers/quantization/fp8_utils.py": (
+        "use_aiter_bpreshuffle_gemm",
+        "use_aiter_bpreshuffle_gemm(output_size)",
+    ),
     # mlp-sync padding, which the launch has no handling for
     "srt/utils/common.py": (
         "BumpAllocator",
@@ -154,15 +169,25 @@ def _covered_layers(hf_config) -> list[int]:
     return [i for i in range(dense, int(t.num_hidden_layers)) if i % freq == 0]
 
 
-def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """What ``SPEC.requires`` cannot state: the shapes, which live on the text
-    config and so are out of ``requires.hf_config``'s reach; aiter's own flags;
-    and FlyDSL."""
-    from sglang.srt.layers.quantization.mxfp4 import (
-        _aiter_situ_uses_gu_interleaved_weights,
-    )
+def _k3_aiter_opt() -> bool:
+    """SGLang's Kimi-K3 AITER switch, which keeps the experts at their native
+    384-wide intermediate: ``SGLANG_OPT_HIP_K3_AITER``, read through Envs (which
+    also takes the old ``SGLANG_AITER_K3_OPT``), or the old name before the
+    rename."""
+    from sglang.srt.environ import envs
+
+    field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
+    if field is not None:
+        return bool(field.get())
     from sglang.srt.utils.common import get_bool_env_var
 
+    return get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    """What ``SPEC.requires`` cannot state: the shapes, which live on the text
+    config and so are out of ``requires.hf_config``'s reach; SGLang's K3 AITER
+    switch; and FlyDSL."""
     t = _text_config(hf_config)
     linear = _linear_attn_config(hf_config)
     reasons = [
@@ -188,16 +213,66 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"attn_res_block_size {block} gives layer {last} {blocks} "
                 f"attention-residual blocks, the launch is built for {MAX_BLOCKS}"
             )
-    if not _aiter_situ_uses_gu_interleaved_weights():
+    if not _k3_aiter_opt():
         reasons.append(
-            "needs the MXFP4 experts in aiter's gate / up interleaved layout; "
-            "set AITER_SITUV2_A8W4=1 or leave AITER_SITUV2_A4W4 unset"
+            "needs SGLANG_OPT_HIP_K3_AITER=1 (SGLANG_AITER_K3_OPT=1 before the "
+            "rename): without it the experts are padded past their native "
+            "384-wide intermediate"
         )
-    if not get_bool_env_var("SGLANG_AITER_K3_OPT"):
-        reasons.append("needs SGLANG_AITER_K3_OPT=1")
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
+
+
+def _o_proj_operands(o_proj):
+    """o_proj as the launch reads it: (``O_*`` format, the [7168, 1536] storage,
+    its fp32 scale a row or None). Raises ValueError naming what does not fit.
+
+    A Quark per-channel FP8 o_proj is stored transposed for SGLang's GEMM, so
+    the storage is ``weight.t()``; it is in AITER's (16, 16) preshuffle exactly
+    when SGLang's own ``use_aiter_bpreshuffle_gemm`` chose that at load. The
+    launch widens it to bf16 in registers and scales each row's fp32 sum, so it
+    multiplies the bf16 core, not SGLang's per-token FP8 copy of it.
+    """
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
+    hidden = HF_CONFIG["hidden_size"]
+    weight = getattr(o_proj, "weight", None)
+    if weight is None:
+        raise ValueError("o_proj has no weight")
+    if getattr(o_proj, "bias", None) is not None:
+        raise ValueError("o_proj has a bias")
+    if weight.dtype == torch.bfloat16:
+        if tuple(weight.shape) != (hidden, CORE) or not weight.is_contiguous():
+            raise ValueError(f"o_proj is not a contiguous bf16 [{hidden}, {CORE}]")
+        return oproj.O_BF16, weight, None
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"o_proj is {weight.dtype}, not bf16 or Quark FP8 E4M3")
+    from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = getattr(o_proj, "scheme", None)
+    if not (
+        isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
+    ):
+        raise ValueError("an FP8 o_proj is read only as Quark per-channel FP8")
+    storage = weight.t()
+    if tuple(storage.shape) != (hidden, CORE) or not storage.is_contiguous():
+        raise ValueError(
+            f"the FP8 o_proj is not SGLang's transposed contiguous [{hidden}, {CORE}]"
+        )
+    scale = getattr(o_proj, "weight_scale", None)
+    if not (
+        isinstance(scale, torch.Tensor)
+        and scale.dtype == torch.float32
+        and scale.numel() == hidden
+        and scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"the FP8 o_proj has no fp32 scale for each of its {hidden} rows"
+        )
+    fmt = oproj.O_FP8_SHUFFLED if use_aiter_bpreshuffle_gemm(hidden) else oproj.O_FP8
+    return fmt, storage, scale.view(hidden)
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
@@ -205,6 +280,8 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
     were the expected one."""
     from sglang.srt.utils.common import require_mlp_sync
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import LAT, RI, E
 
     hidden = HF_CONFIG["hidden_size"]
     covered = _covered_layers(hf_config)
@@ -219,8 +296,11 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         attn, moe = layer.self_attn, layer.mlp
         experts = getattr(moe, "experts", None)
         up = getattr(moe, "routed_expert_up_proj", None)
-        o_proj = getattr(attn, "o_proj", None)
-        weight = getattr(o_proj, "weight", None)
+        try:
+            _o_proj_operands(getattr(attn, "o_proj", None))
+            o_proj_reason = None
+        except ValueError as e:
+            o_proj_reason = str(e)
         checks = (
             (moe.use_latent_moe, "not a latent MoE layer"),
             (moe.routed_expert_norm is not None, "no latent RMSNorm"),
@@ -235,6 +315,17 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 and getattr(experts.w13_weight, "is_shuffled", False)
                 and getattr(experts.w2_weight, "is_shuffled", False),
                 "the experts are not in aiter's preshuffled MXFP4 layout",
+            ),
+            # The launch indexes an expert at its native 384-wide intermediate;
+            # a padded one (512) would be read at the wrong strides.
+            (
+                experts is None
+                or (
+                    tuple(experts.w13_weight.shape) == (E, 2 * RI, LAT // 2)
+                    and tuple(experts.w2_weight.shape) == (E, LAT, RI // 2)
+                ),
+                f"the experts are not [{E}, {2 * RI}, {LAT // 2}] / "
+                f"[{E}, {LAT}, {RI // 2}] packed MXFP4 (a padded intermediate)",
             ),
             (layer.use_attn_residuals, "no attention-residual stream"),
             # SP-MoE reduce-scatters o_proj's output and the fused all-reduce
@@ -254,17 +345,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 "the MLA output gate is off, and the split before o_proj "
                 "rides on its wrapper (mla_use_output_gate)",
             ),
-            (
-                weight is not None
-                and weight.dtype == torch.bfloat16
-                and tuple(weight.shape) == (hidden, CORE)
-                and weight.is_contiguous(),
-                f"o_proj is not a contiguous bf16 [{hidden}, {CORE}]",
-            ),
-            (
-                o_proj is not None and getattr(o_proj, "bias", None) is None,
-                "o_proj has a bias",
-            ),
+            (o_proj_reason is None, o_proj_reason),
         )
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
@@ -438,6 +519,9 @@ class _Layer(msgspec.Struct):
     key: Any
     module: Any  # the KimiK3DecoderLayer, for the tensors read per step
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
+    # o_proj's storage and its FP8 scale (None for bf16): _o_proj_operands
+    w_o: Any = None
+    w_os: Any = None
 
 
 def _k2_blocks(layer) -> int:
@@ -454,6 +538,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
+    ofmt, w_o, w_os = _o_proj_operands(layer.self_attn.o_proj)
     return _Layer(
         k1=k1_mod.build(layer, i, rows),
         i=i,
@@ -465,20 +550,24 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             ln_eps=moe.routed_expert_norm.variance_epsilon,
             reset=layer.is_block_write_layer,
             guint=_gu_interleaved(moe),
+            ofmt=ofmt,
             fault_site=runner.fault_site,
             fault_after=runner.fault_after,
         ),
         module=layer,
+        w_o=w_o,
+        w_os=w_os,
     )
 
 
 def _gu_interleaved(moe) -> bool:
     """Whether the experts carry the gate / up interleaved MXFP4 layout.
 
-    ``is_shuffled`` alone cannot answer this: Mxfp4MoEMethod sets it on both of
-    its branches and only the SiTU A8W4 branch interleaves. Reading those bytes
-    with the wrong layout does not fail, it returns wrong numbers, so ask the
-    same question Mxfp4MoEMethod asked.
+    ``is_shuffled`` alone cannot answer this: Mxfp4MoEMethod and Quark's MXFP4
+    MoE set it on both of their branches, and only the SiTU branch AITER runs
+    as A8W4 or A16W4 interleaves; ``AITER_SITUV2_A4W4`` alone keeps gate and up
+    separated. Reading those bytes with the wrong layout does not fail, it
+    returns wrong numbers, so ask the same question both methods asked.
     """
     from sglang.srt.layers.quantization.mxfp4 import (
         _aiter_situ_uses_gu_interleaved_weights,
@@ -508,7 +597,8 @@ def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out) -> None:
     k2.k2_launch(
         packed.key,
         core=core,
-        w_o=module.self_attn.o_proj.weight,
+        w_o=packed.w_o,
+        w_os=packed.w_os,
         prefix=prefix,
         blocks=blocks,
         ares_nw=module.mlp_res_norm.weight,
