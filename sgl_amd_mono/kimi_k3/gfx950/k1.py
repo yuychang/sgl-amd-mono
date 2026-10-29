@@ -41,7 +41,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sgl_amd_mono.kimi_k3 import MAX_ROWS
+from sgl_amd_mono.kimi_k3 import MAX_BLOCKS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ SGLANG_READS = {
         "select_verify_intermediate_state_indices",
     ),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
+        "mamba_map",
         "intermediate_ssm",
         "intermediate_conv_window",
     ),
@@ -275,14 +275,15 @@ def build_batch(packed_layers, device) -> Optional[K1Batch]:
 
 
 def scratch_bytes(rows: int) -> int:
-    """What one K1 launch needs, for the runner's shared scratch."""
+    """What one K1 launch needs, for the runner's shared scratch: at the most
+    bank rows a seam reads, since its partials grow with them."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     return kda.scratch_bytes(
         kda.KdaPreBuild(
             tokens=rows,
             qlen=rows,
-            nblocks=1,
+            nblocks=MAX_BLOCKS,
             delta=False,
             state_len=rows + kda.CONV_W - 1,
         )
@@ -376,7 +377,7 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
         # the tensor that gathers them, once. A capture would otherwise take
         # the host-to-device copy of this constant with it.
         for k in batch.layers:
-            k.mamba_idx = pool.mamba2_layer_index(k.module.self_attn.attn.layer_id)
+            k.mamba_idx = pool.mamba_map[k.module.self_attn.attn.layer_id]
         batch.idx = torch.tensor(
             [k.mamba_idx for k in batch.layers],
             dtype=torch.int64,

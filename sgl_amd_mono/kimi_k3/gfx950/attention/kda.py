@@ -801,6 +801,8 @@ def kda_pre(
         "a slot's state must be dense; slots may be strided"
     )
     assert conv_state.dtype == torch.bfloat16
+    # the launch writes its whole layout; a short buffer is overrun, not refused
+    assert scratch.numel() >= scratch_bytes(key), (scratch.numel(), scratch_bytes(key))
     f = build(key)
     f(
         prefix.data_ptr(),
