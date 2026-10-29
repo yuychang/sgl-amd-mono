@@ -220,6 +220,63 @@ def test_the_fp8_o_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffled):
     assert tuple(scale.shape) == (HF_CONFIG["hidden_size"],)
 
 
+@pytest.mark.parametrize("shuffled", [True, False])
+def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffled):
+    # SGLang's merged Quark FP8 KDA in-projection is fused_qkvg_proj's own weight,
+    # padded to 6336 rows, with f_b kept as a bf16 copy. K1 must read the layout
+    # SGLang stored, and that copy of f_b rather than the FP8 f_b_proj.
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: shuffled)
+    rows = 6336
+    attn = SimpleNamespace(
+        use_full_rank_gate=True,
+        _qkvgbfa_in_qkvg_proj=True,
+        fused_qkvg_proj=SimpleNamespace(
+            weight=torch.zeros(rows, kda.HIDDEN, dtype=torch.float8_e4m3fn).t(),
+            weight_scale=torch.ones(rows, 1, dtype=torch.float32),
+            scheme=QuarkW8A8Fp8(
+                {"qscheme": "per_channel"},
+                {"qscheme": "per_channel", "is_dynamic": True},
+            ),
+        ),
+        _bfa_f_b_w=torch.zeros(kda.PROJ, kda.HD, dtype=torch.bfloat16),
+    )
+    fmt, w_in, scale, w_fb = k1._in_proj_operands(attn)
+    assert fmt == (kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8)
+    assert tuple(w_in.shape) == (rows, kda.HIDDEN) and w_in.is_contiguous()
+    assert tuple(scale.shape) == (rows,)
+    assert w_fb is attn._bfa_f_b_w
+
+
+def test_k1_builds_for_replayssm_and_a_bf16_state(monkeypatch):
+    # The AgentX recipe's KDA state: --mamba-ssm-dtype bfloat16 and the ReplaySSM
+    # ring. Each picks a launch variant; only a state dtype K1 has none for is
+    # refused.
+    import sglang.srt.runtime_context as runtime_context
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    mamba = SimpleNamespace(
+        mamba_ssm_dtype="bfloat16",
+        enable_linear_replayssm_spec=True,
+        linear_replayssm_cache_len=16,
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
+    )
+    assert k1._state_config() == (True, 16, [])
+    mamba.mamba_ssm_dtype, mamba.enable_linear_replayssm_spec = "float32", False
+    assert k1._state_config() == (False, 0, [])
+    mamba.mamba_ssm_dtype = "float16"
+    assert "float32 or bfloat16" in k1._state_config()[2][0]
+
+
 def test_padded_experts_are_refused(monkeypatch):
     # Without SGLANG_OPT_HIP_K3_AITER the intermediate is padded to 512.
     reasons = _reasons(monkeypatch, _fake_layer(ri=512))

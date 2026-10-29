@@ -52,6 +52,11 @@ def _cos(a, b):
     )
 
 
+def _rel(a, b):
+    a, b = a.float(), b.float()
+    return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+
 def _rms(x, weight, eps):
     x = x.float()
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
@@ -65,7 +70,7 @@ def _seam_reference(prefix, blocks, nvb, ares_nw, ares_qk, in_nw, eps, out_eps):
     return _rms(mixed, in_nw, out_eps).to(BF)
 
 
-def _kda_reference(case):
+def _kda_reference(case, parts=None):
     """core_out in torch, from the kernel's own in-projection.
 
     Derived from the kernel source rather than from SGLang's KDA path: the two
@@ -76,6 +81,10 @@ def _kda_reference(case):
 
     Feeds on ``proj_dbg`` for the same reason the layer test feeds on the
     kernel's own x: a rounding difference upstream must not be reported here.
+
+    ``parts``, a dict, also receives what the step leaves behind, indexed
+    [token, head, ...]: the state after each token, and the ReplaySSM ring rows
+    (raw k and v before the l2norm and the delta, the log-decay gate, beta).
     """
     kda = case.kda
     L, hd, nh, proj_w = case.L, kda.HD, kda.NH, kda.PROJ
@@ -98,6 +107,7 @@ def _kda_reference(case):
     q_all, k_all, v_all = (
         conv[:, i * proj_w : (i + 1) * proj_w].reshape(L, nh, hd) for i in range(3)
     )
+    raw_k = k_all
 
     def l2(x, scale):
         return x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + 1e-6) * scale
@@ -107,12 +117,16 @@ def _kda_reference(case):
 
     fa = proj[:, kda.FA_0 : kda.FA_0 + hd]  # [L, HD]
     out = torch.empty(case.S, proj_w, dtype=torch.float32, device=proj.device)
+    states = torch.empty(L, nh, hd, hd, dtype=torch.float32, device=proj.device)
+    gates = torch.empty(L, nh, hd, dtype=torch.float32, device=proj.device)
+    betas = torch.empty(L, nh, dtype=torch.float32, device=proj.device)
     for h in range(nh):
         beta = torch.sigmoid(proj[:, kda.BETA_0 + h])  # [L]
         g1 = fa.to(BF).float() @ case.w_fb[h * hd : (h + 1) * hd].float().t()
         g = g1 + case.dt_bias[h * hd : (h + 1) * hd].float()
         gate = -5.0 * torch.sigmoid(torch.exp(case.a_log[h].float()) * g)
         decay = torch.exp(gate)  # [L, HD], per-K
+        gates[:, h], betas[:, h] = gate, beta
 
         state = case.rstate_in[slot0, h].float().clone()  # [V, K]
         o = torch.empty(L, hd, dtype=torch.float32, device=proj.device)
@@ -121,20 +135,45 @@ def _kda_reference(case):
             delta = (v_all[j, h] - state @ k_all[j, h]) * beta[j]
             state = state + delta.unsqueeze(1) * k_all[j, h].unsqueeze(0)
             o[j] = state @ q_all[j, h]
+            states[j, h] = state
 
         r = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + EPS)
         g2 = proj[:, kda.G2_0 + h * hd : kda.G2_0 + (h + 1) * hd]
         out[:, h * hd : (h + 1) * hd] = o * r * case.on_w.float() * torch.sigmoid(g2)
+    if parts is not None:
+        parts.update(states=states, raw_k=raw_k, raw_v=v_all, gate=gates, beta=betas)
     return out.to(BF)
+
+
+def _fold(state, raw_k, raw_v, gate, beta):
+    """SGLang's ReplaySSM commit for one head, in torch: the ring rows of the
+    accepted tokens replayed onto the committed state [V, K]."""
+    for j in range(raw_k.shape[0]):
+        k = raw_k[j] / torch.sqrt(raw_k[j].pow(2).sum() + 1e-6)
+        state = state * torch.exp(gate[j]).unsqueeze(0)
+        v = (raw_v[j] - state @ k) * beta[j]
+        state = state + v.unsqueeze(1) * k.unsqueeze(0)
+    return state
 
 
 class K1Case:
     """One synthetic K1 launch: its inputs, and the tensors it wrote."""
 
-    def __init__(self, device, *, num_acc, state_len=None, write_idx=-1):
+    def __init__(
+        self,
+        device,
+        *,
+        num_acc,
+        state_len=None,
+        write_idx=-1,
+        state_bf16=False,
+        ring_len=0,
+        wfmt=0,
+    ):
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
         self.kda = kda
+        self.state_bf16, self.ring_len, self.wfmt = state_bf16, ring_len, wfmt
         self.device = device
         self.L = QLEN
         self.S = REQS * QLEN
@@ -174,7 +213,35 @@ class K1Case:
         self.rstate = _randn(
             g, nslots, kda.NH, kda.HD, kda.HD, scale=0.05, dtype=torch.float32
         )
+        if state_bf16:
+            self.rstate = self.rstate.to(BF)
         self.rstate_in = self.rstate.clone()
+        # SGLang's ReplaySSM ring of one layer: [slots, heads, ring_len, ...]
+        self.ring = None
+        if ring_len:
+            ring = (nslots, kda.NH, ring_len)
+            self.ring = (
+                torch.zeros(*ring, kda.HD, dtype=BF, device=device),
+                torch.zeros(*ring, kda.HD, dtype=BF, device=device),
+                torch.zeros(*ring, kda.HD, dtype=torch.float32, device=device),
+                torch.zeros(*ring, dtype=torch.float32, device=device),
+            )
+        # An FP8 in_proj as SGLang stores its merged Quark one: E4M3 rows, an
+        # fp32 scale a row, padded to a multiple of 64 rows and preshuffled.
+        self.w_store, self.w_scale = self.w_in, None
+        if wfmt:
+            rows = kda.NPROJ if wfmt == kda.W_FP8 else -(-kda.NPROJ // 64) * 64
+            w = torch.zeros(rows, h, dtype=torch.float32, device=device)
+            w[: kda.NPROJ] = self.w_in.float()
+            scale = w.abs().amax(dim=1).clamp(min=1e-12) / 448.0
+            q = (w / scale[:, None]).to(torch.float8_e4m3fn)
+            self.w_in = (q.float() * scale[:, None])[: kda.NPROJ].to(BF)
+            self.w_dq = q.float() * scale[:, None]  # the values the kernel reads
+            if wfmt == kda.W_FP8_SHUFFLED:
+                from aiter.ops.shuffle import shuffle_weight
+
+                q = shuffle_weight(q.clone(), (16, 16))
+            self.w_store, self.w_scale = q.contiguous(), scale.contiguous()
 
         self.core_out = torch.zeros(self.S, kda.PROJ, dtype=BF, device=device)
         self.x_dbg = torch.zeros(self.S, h, dtype=BF, device=device)
@@ -193,6 +260,9 @@ class K1Case:
             onorm_eps=EPS,
             debug=True,
             write_idx=self.write_idx,
+            wfmt=self.wfmt,
+            state_bf16=self.state_bf16,
+            ring_len=self.ring_len,
         )
         scratch = torch.zeros(
             kda.scratch_bytes(key), dtype=torch.uint8, device=self.device
@@ -206,7 +276,9 @@ class K1Case:
             ares_nw=self.ares_nw,
             ares_qk=self.ares_qk,
             in_nw=self.in_nw,
-            w_in=self.w_in,
+            w_in=self.w_store,
+            w_in_scale=self.w_scale,
+            ring=self.ring,
             w_fb=self.w_fb,
             conv_w=self.conv_w,
             conv_state=self.conv_state,
@@ -495,6 +567,97 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
             f"short state_len {short.state_len}: carry entry {win - 1} differs "
             f"(read index {acc_idx + win} does not exist), launch succeeded"
         )
+
+    def test_bf16_state_matches_torch(self):
+        """--mamba-ssm-dtype bfloat16: the state is read and written in bf16.
+
+        The kernel reads a state row as raw words, so an fp32 read of a bf16
+        pool is not an error, it is a different state.
+        """
+        case = K1Case(self.device, num_acc=QLEN, state_bf16=True).run()
+        parts = {}
+        cos = _cos(case.core_out, _kda_reference(case, parts))
+        self.assertGreater(cos, COS_MIN, f"core_out on a bf16 state: cos {cos:.6f}")
+        written = case.rstate[case.st_idx[0].long()].float()
+        cos = _cos(written, parts["states"])
+        print(f"bf16 state: written states cos {cos:.6f}")
+        self.assertGreater(cos, COS_MIN, "the bf16 states written differ")
+
+    def test_replayssm_ring(self):
+        """ReplaySSM: no state is written, and the ring rows are what SGLang's
+        commit replays onto the committed state.
+
+        The commit folds the ring of the request's own slot, positions 0 ..
+        accepted, onto that slot's state. So the rows must sit at [slot, head,
+        token], hold k and v before the l2norm and the delta, and fold back to
+        the state this step's recurrence reached.
+        """
+        slot, h = 3, 5
+        for state_bf16 in (False, True):
+            case = K1Case(self.device, num_acc=1, ring_len=16, state_bf16=state_bf16)
+            case.st_idx = torch.full_like(case.st_idx, slot)
+            case.run()
+            parts = {}
+            want = _kda_reference(case, parts)
+            rk, rv, rg, rb = (t[slot, :, :QLEN] for t in case.ring)
+            with self.subTest(state_bf16=state_bf16):
+                self.assertGreater(_cos(case.core_out, want), COS_MIN)
+                self.assertTrue(
+                    torch.equal(case.rstate, case.rstate_in),
+                    "the ring mode wrote state",
+                )
+                for name, got, ref in (
+                    ("raw k", rk.transpose(0, 1), parts["raw_k"]),
+                    ("raw v", rv.transpose(0, 1), parts["raw_v"]),
+                    ("gate", rg.transpose(0, 1), parts["gate"]),
+                    ("beta", rb.t(), parts["beta"]),
+                ):
+                    rel = _rel(got, ref)
+                    self.assertLess(rel, 1e-2, f"ring {name}: rel {rel:.4g}")
+                touched = [
+                    int(torch.count_nonzero(t))
+                    - int(torch.count_nonzero(t[slot, :, :QLEN]))
+                    for t in case.ring
+                ]
+                self.assertEqual(
+                    touched, [0] * 4, "a ring row outside the step was written"
+                )
+                folded = _fold(
+                    case.rstate_in[slot, h].float(),
+                    rk[h].float(),
+                    rv[h].float(),
+                    rg[h],
+                    rb[h],
+                )
+                cos = _cos(folded, parts["states"][-1, h])
+                print(
+                    f"ring (bf16 state {state_bf16}): fold vs recurrence cos {cos:.6f}"
+                )
+                self.assertGreater(cos, COS_MIN, "the ring does not fold to the state")
+
+        case = K1Case(self.device, num_acc=1, ring_len=16)
+        case.st_idx = torch.full_like(case.st_idx, -1)
+        case.run()
+        self.assertEqual(
+            [int(torch.count_nonzero(t)) for t in case.ring],
+            [0] * 4,
+            "a negative slot should write no ring row",
+        )
+
+    def test_fp8_in_proj(self):
+        """A Quark per-channel FP8 in_proj, row-major and in AITER's (16, 16)
+        preshuffle, which is how SGLang stores its 6336-row merged one."""
+        kda = self.case.kda
+        real = 6284
+        for wfmt in (kda.W_FP8, kda.W_FP8_SHUFFLED):
+            case = K1Case(self.device, num_acc=QLEN, wfmt=wfmt).run()
+            want = F.linear(case.x_dbg.float(), case.w_dq[:real])
+            with self.subTest(wfmt=wfmt):
+                cos = _cos(case.proj_dbg[:, :real], want)
+                print(f"fp8 in_proj (wfmt {wfmt}): cos {cos:.6f}")
+                self.assertGreater(cos, COS_MIN, "the FP8 in-projection differs")
+                cos = _cos(case.core_out, _kda_reference(case))
+                self.assertGreater(cos, COS_MIN, f"core_out: cos {cos:.6f}")
 
     def test_block_write_layer_snapshots_the_prefix(self):
         """write_idx >= 0 stores the updated prefix into that bank row.

@@ -224,16 +224,45 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+def _quark_fp8_storage(linear, name: str):
+    """A Quark per-channel FP8 linear as SGLang stored it for its FP8 GEMM:
+    (whether it is in AITER's (16, 16) preshuffle, the [out, in] storage, its
+    fp32 scale a row). Raises ValueError naming what does not fit.
+
+    SGLang stores the weight transposed for its GEMM, so the storage is
+    ``weight.t()``; it is preshuffled exactly when its own
+    ``use_aiter_bpreshuffle_gemm`` chose that at load. The launches widen it to
+    bf16 in registers and scale each row's fp32 sum, so they multiply the bf16
+    activation, not SGLang's per-token FP8 copy of it.
+    """
+    from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = getattr(linear, "scheme", None)
+    if not (
+        isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
+    ):
+        raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    storage = linear.weight.t()
+    if storage.dim() != 2 or not storage.is_contiguous():
+        raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
+    rows = storage.shape[0]
+    scale = getattr(linear, "weight_scale", None)
+    if not (
+        isinstance(scale, torch.Tensor)
+        and scale.dtype == torch.float32
+        and scale.numel() == rows
+        and scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"the FP8 {name} has no fp32 scale for each of its {rows} rows"
+        )
+    return use_aiter_bpreshuffle_gemm(rows), storage, scale.view(rows)
+
+
 def _o_proj_operands(o_proj):
     """o_proj as the launch reads it: (``O_*`` format, the [7168, 1536] storage,
-    its fp32 scale a row or None). Raises ValueError naming what does not fit.
-
-    A Quark per-channel FP8 o_proj is stored transposed for SGLang's GEMM, so
-    the storage is ``weight.t()``; it is in AITER's (16, 16) preshuffle exactly
-    when SGLang's own ``use_aiter_bpreshuffle_gemm`` chose that at load. The
-    launch widens it to bf16 in registers and scales each row's fp32 sum, so it
-    multiplies the bf16 core, not SGLang's per-token FP8 copy of it.
-    """
+    its fp32 scale a row or None). Raises ValueError naming what does not fit."""
     from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
 
     hidden = HF_CONFIG["hidden_size"]
@@ -248,31 +277,12 @@ def _o_proj_operands(o_proj):
         return oproj.O_BF16, weight, None
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(f"o_proj is {weight.dtype}, not bf16 or Quark FP8 E4M3")
-    from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
-    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
-
-    scheme = getattr(o_proj, "scheme", None)
-    if not (
-        isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
-    ):
-        raise ValueError("an FP8 o_proj is read only as Quark per-channel FP8")
-    storage = weight.t()
-    if tuple(storage.shape) != (hidden, CORE) or not storage.is_contiguous():
+    shuffled, storage, scale = _quark_fp8_storage(o_proj, "o_proj")
+    if tuple(storage.shape) != (hidden, CORE):
         raise ValueError(
-            f"the FP8 o_proj is not SGLang's transposed contiguous [{hidden}, {CORE}]"
+            f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"
         )
-    scale = getattr(o_proj, "weight_scale", None)
-    if not (
-        isinstance(scale, torch.Tensor)
-        and scale.dtype == torch.float32
-        and scale.numel() == hidden
-        and scale.is_contiguous()
-    ):
-        raise ValueError(
-            f"the FP8 o_proj has no fp32 scale for each of its {hidden} rows"
-        )
-    fmt = oproj.O_FP8_SHUFFLED if use_aiter_bpreshuffle_gemm(hidden) else oproj.O_FP8
-    return fmt, storage, scale.view(hidden)
+    return (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8), storage, scale
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
@@ -473,6 +483,32 @@ NUMERICS = Numerics(
         # points down. Measured exact, so the bound is tight on purpose.
         "k1.window.cosine": 1.0 - 1e-6,
         "k1.window.rel": 0.001,
+        # K1 on a Quark FP8 in-projection (k1_fp8), against the same check. SGLang
+        # quantizes the projection's input to FP8 a token and K1 multiplies it
+        # in bf16, so every output moves by that quantization, about 1%; the
+        # bank row is still exact. Worst of 10385 layer steps of three requests
+        # at TP8 with ReplaySSM and a bf16 state, with room:
+        #
+        #   core    cos 0.99788   rel 0.065    window  cos 0.99994  rel 0.0115
+        #   ring_k  cos 0.99990   rel 0.0139   ring_v  cos 0.99970  rel 0.0245
+        #   ring_g  cos 0.99988   rel 0.0167   ring_b  cos 0.99995  rel 0.0100
+        #
+        # ring_* are the ReplaySSM ring rows the commit replays (raw k / v, the
+        # log-decay gate, beta), in place of the ssm state.
+        "k1_fp8.core.cosine": 0.997,
+        "k1_fp8.core.rel": 0.08,
+        "k1_fp8.bank.cosine": 1.0 - 1e-6,
+        "k1_fp8.bank.rel": 0.0,
+        "k1_fp8.window.cosine": 0.9999,
+        "k1_fp8.window.rel": 0.015,
+        "k1_fp8.ring_k.cosine": 0.9998,
+        "k1_fp8.ring_k.rel": 0.02,
+        "k1_fp8.ring_v.cosine": 0.9995,
+        "k1_fp8.ring_v.rel": 0.03,
+        "k1_fp8.ring_g.cosine": 0.9997,
+        "k1_fp8.ring_g.rel": 0.025,
+        "k1_fp8.ring_b.cosine": 0.9999,
+        "k1_fp8.ring_b.rel": 0.015,
     },
 )
 
