@@ -125,6 +125,13 @@ SGLANG_READS = {
         "written_residual",
     ),
     "srt/runtime_context.py": ("get_parallel",),
+    # the context-parallel server args _context_parallel_reasons checks
+    "srt/arg_groups/fields/*.py": (
+        "dcp_size",
+        "dcp_comm_backend",
+        "attn_cp_size",
+        "enable_prefill_cp",
+    ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
     "srt/models/kimi_k3.py": (
@@ -187,7 +194,7 @@ def _k3_aiter_opt() -> bool:
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the shapes, which live on the text
     config and so are out of ``requires.hf_config``'s reach; SGLang's K3 AITER
-    switch; and FlyDSL."""
+    switch; FlyDSL; and which context-parallel modes are served."""
     t = _text_config(hf_config)
     linear = _linear_attn_config(hf_config)
     reasons = [
@@ -221,6 +228,31 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         )
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
+    if cfg is not None:
+        reasons += _context_parallel_reasons(cfg)
+    return reasons
+
+
+def _context_parallel_reasons(cfg) -> list[str]:
+    """Feature.CONTEXT_PARALLEL admits attention and prefill context parallelism
+    too. Only decode context parallelism over the whole TP group is served, as
+    in vLLM's Kimi-K3 specialized decode, on the a2a exchange it was validated
+    with; the others are untested."""
+    reasons = []
+    dcp = cfg.dcp_size or 1
+    if dcp not in (1, TP_SIZE):
+        reasons.append(f"--dcp-size {dcp} is neither 1 nor the TP size {TP_SIZE}")
+    elif dcp > 1 and cfg.dcp_comm_backend != "a2a":
+        reasons.append(
+            f"--dcp-comm-backend {cfg.dcp_comm_backend} is not served; DCP runs on a2a"
+        )
+    if (cfg.attn_cp_size or 1) > 1:
+        reasons.append(
+            f"--attn-cp-size {cfg.attn_cp_size} is attention context parallelism, "
+            "which is not served"
+        )
+    if cfg.enable_prefill_cp:
+        reasons.append("--enable-prefill-cp is not served")
     return reasons
 
 
@@ -538,8 +570,10 @@ SPEC = MonoSpec(
         )
     },
     # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most MAX_ROWS rows takes the same launch.
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # at most MAX_ROWS rows takes the same launch. Decode context parallelism
+    # stays inside SGLang's MLA, before o_proj's input; _context_parallel_reasons
+    # refuses the other context-parallel modes this feature also admits.
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
