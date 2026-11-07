@@ -98,6 +98,35 @@ def test_a_block_size_past_the_launch_is_refused():
     assert not any("attention-residual blocks" in r for r in ok), ok
 
 
+def _cp_reasons(**overrides):
+    # SGLang's resolved values: DCP 1 resolves to ag_rs, DCP 8 on ROCm to a2a
+    cfg = {"dcp_size": 1, "dcp_comm_backend": "ag_rs", "attn_cp_size": 1,
+           "enable_prefill_cp": False, **overrides}  # fmt: skip
+    return k3._context_parallel_reasons(SimpleNamespace(**cfg))
+
+
+def test_decode_context_parallel_over_the_tp_group_is_served():
+    # vLLM's Kimi-K3 specialized decode runs at DCP 1 or the TP size; DCP stays
+    # inside SGLang's MLA, before the launch's o_proj input.
+    assert registry.Feature.CONTEXT_PARALLEL in k3.SPEC.features
+    assert _cp_reasons() == []
+    assert _cp_reasons(dcp_size=8, dcp_comm_backend="a2a") == []
+
+
+@pytest.mark.parametrize(
+    "overrides, needle",
+    [
+        ({"dcp_size": 2, "dcp_comm_backend": "a2a"}, "--dcp-size 2"),
+        ({"dcp_size": 8, "dcp_comm_backend": "ag_rs"}, "--dcp-comm-backend ag_rs"),
+        ({"attn_cp_size": 2}, "--attn-cp-size 2"),
+        ({"enable_prefill_cp": True}, "--enable-prefill-cp"),
+    ],
+)
+def test_other_context_parallel_modes_are_refused(overrides, needle):
+    # Feature.CONTEXT_PARALLEL also admits these; the spec has to name them.
+    assert any(needle in r for r in _cp_reasons(**overrides))
+
+
 def test_the_bounds_name_the_launches_and_their_outputs():
     for name in ("k2.prefix.cosine", "k2.x.cosine", "k2.out.cosine", "moe.out.cosine"):
         assert 0.0 < k3.SPEC.numerics.bound(name) <= 1.0
