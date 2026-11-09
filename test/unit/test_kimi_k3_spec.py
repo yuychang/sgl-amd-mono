@@ -156,7 +156,7 @@ def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384):
 
 
 def _reasons(monkeypatch, layer):
-    import sglang.srt.utils.common as common
+    import sglang.srt.layers.dp_attention as common
 
     monkeypatch.setattr(common, "require_mlp_sync", lambda: False)
     model = SimpleNamespace(model=SimpleNamespace(layers={i: layer for i in range(93)}))
