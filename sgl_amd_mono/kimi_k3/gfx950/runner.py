@@ -13,7 +13,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
-from sgl_amd_mono.kimi_k3 import MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import MAX_ROWS
 
 
 class K3MonoRunner:
@@ -24,7 +24,7 @@ class K3MonoRunner:
     """
 
     def __init__(self, tp: int, rank: int, group, device) -> None:
-        from sgl_amd_mono.kimi_k3.gfx950 import k1, layer
+        from sgl_amd_mono.kimi_k3.gfx950 import layer
         from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
         self.tp, self.rank, self.device = tp, rank, device
@@ -32,24 +32,24 @@ class K3MonoRunner:
         # through first, compiled into this rank's build key
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         # The launches run one after another, so one buffer the widest of them
-        # fits. K1 is the widest.
-        n = max(
-            moe.scratch_bytes(moe.MoeBuild(tokens=MAX_ROWS)),
-            layer.scratch_bytes(layer.K2Build(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
-            k1.scratch_bytes(MAX_ROWS),
-        )
-        self.scratch_bytes = (n + 255) // 256 * 256
-        self.scratch = torch.zeros(self.scratch_bytes, dtype=torch.uint8, device=device)
+        # fits, then K2's tagged x rows.
+        self.scratch_bytes = (layer.scratch_alloc_bytes() + 255) // 256 * 256
+        # The hand-off mailboxes uncached, as GLM-5.3-Flash's: a consumer reads a
+        # line at its home memory, not through the producer XCD's L2. A one-rank
+        # peer buffer, never freed while the process lives (see PeerBuffer).
+        self._scratch = PeerBuffer(self.scratch_bytes, group, rank, 1, device)
+        self.scratch = self._scratch.bytes
+        self.scratch.zero_()
         # [the step epoch, the guard block (deadline, error words)]
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # The MoE launch's task queue. The layer launch takes none -- its ABI
         # has no queue -- and this is here for the kernel checks' MoE launch.
         self.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
-        # past the two parity halves, the guard's flag word a rank. The kernel
-        # reads the flags at the same offset, from the same function.
-        nbytes = layer.flags_offset()
-        self.peer = PeerBuffer(nbytes + guard.FLAG_BYTES, group, rank, tp, device)
-        self.peer.bytes.zero_()
+        # past the two parity halves, the guard's flag word a rank, then K2's
+        # sentinel regions. The kernel reads them at the same offsets, from the
+        # same functions.
+        self.peer = PeerBuffer(layer.peer_alloc_bytes(), group, rank, tp, device)
+        layer.init_peer(self.peer.bytes)
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
             MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device
@@ -80,3 +80,5 @@ class K3MonoRunner:
 
     def close(self) -> None:
         self.peer.close()
+        if self._scratch is not None:
+            self._scratch.close()

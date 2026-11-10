@@ -109,7 +109,21 @@ def fp8_o_proj(w_o, shuffled):
     return q, storage.contiguous(), scale.contiguous()
 
 
-def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
+def run(
+    k2,
+    w,
+    scratch,
+    *,
+    reset,
+    peers,
+    epoch,
+    rank,
+    layer,
+    guint,
+    fold=False,
+    tl=None,
+    opt=0,
+):
     """One layer launch -> (out, the updated prefix, the build key the caller
     reads the seam output back with)."""
     key = k2.K2Build(
@@ -120,10 +134,14 @@ def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
         reset=reset,
         guint=guint,
         ofmt=w["ofmt"],
+        fold=fold,
+        opt=opt,
+        timeline=tl is not None,
     )
     # The kernel updates the prefix in place, so hand it a copy and keep the
-    # input for the reference.
-    prefix = w["prefix"].clone()
+    # input for the reference. Under ``fold`` it reads the input in place and
+    # writes a buffer of its own.
+    prefix = torch.empty_like(w["prefix"]) if fold else w["prefix"].clone()
     out = torch.empty_like(prefix)
     k2.k2_launch(
         key,
@@ -152,6 +170,8 @@ def run(k2, w, scratch, *, reset, peers, epoch, rank, layer, guint):
         rank=rank,
         epoch=epoch,
         layer=layer,
+        prefix_in=w["prefix"] if fold else None,
+        tl=tl,
     )
     return out, prefix, key
 
@@ -174,21 +194,17 @@ def main():
     # a rank and the epoch buffer carries the guard block. Without a deadline
     # every wait reads garbage, decides it is late and faults the GPU at 0x0.
     #
-    # Size this from flags_offset(), the same way the runner does. A buffer
+    # Size this from peer_alloc_bytes(), the same way the runner does. A buffer
     # sized for this check's own width puts the flags where the launch does not
     # read them, and the check then passes on a layout no server uses.
-    peers = PeerBuffer(k2.flags_offset() + guard.FLAG_BYTES, cpu, rank, TP, dev)
-    peers.bytes.zero_()
+    peers = PeerBuffer(k2.peer_alloc_bytes(), cpu, rank, TP, dev)
+    k2.init_peer(peers.bytes)
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
     ticks = guard.deadline_ticks(DEADLINE_S)
     lo = ticks & 0xFFFFFFFF
     epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
     epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
-    scratch = torch.zeros(
-        k2.scratch_bytes(k2.K2Build(tokens=ROWS, nblocks=MAX_BLOCKS)),
-        dtype=torch.uint8,
-        device=dev,
-    )
+    scratch = torch.zeros(k2.scratch_alloc_bytes(), dtype=torch.uint8, device=dev)
     from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
 
     w = moe_weights(rank, dev, guint=False)
@@ -249,6 +265,96 @@ def main():
     # ignored the prefix entirely.
     if cos(seen["accumulate"], seen["reset"]) >= NUMERICS.bound("k2.x.cosine"):
         fails.append("the two prefix modes agree, so neither check means anything")
+
+    # The folded launch (the serving form): the seam reads the stream in place
+    # and the reduce writes out + the updated prefix, which must be bit for bit
+    # the unfolded launch's torch add. The input must stay untouched.
+    for tag, reset in (("accumulate", False), ("reset", True)):
+        before = w["prefix"].clone()
+        epoch[0].add_(1)
+        plain, plain_prefix, _ = run(
+            k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
+            rank=rank, layer=1, guint=False,
+        )  # fmt: skip
+        want, plain_prefix = (plain + plain_prefix).clone(), plain_prefix.clone()
+        epoch[0].add_(1)
+        folded, folded_prefix, _ = run(
+            k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
+            rank=rank, layer=1, guint=False, fold=True,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        ok = {
+            "fold out": torch.equal(folded, want),
+            "fold prefix": torch.equal(folded_prefix, plain_prefix),
+            "fold input untouched": torch.equal(w["prefix"], before),
+        }
+        if rank == 0:
+            print(
+                f"fold/{tag}: " + ", ".join(f"{k} {v}" for k, v in ok.items()),
+                flush=True,
+            )
+        fails += [f"{tag}/{n}" for n, v in ok.items() if not v]
+
+    # The OPT_* bits, each alone and all together, against opt=0 on the served
+    # form: bit for bit. A sentinel word is pushed again only two launches
+    # later, so consecutive launches take layers of alternating parity.
+    served = dict(fold=True, guint=False)
+    bits = [
+        k2.OPT_SENT, k2.OPT_PRELOAD, k2.OPT_TAG_X, k2.OPT_SENT_LATR,
+        k2.OPT_SENT_FINAL, k2.OPT_SDOWN_FIRST, k2.OPT_RLOG_PARTS, k2.OPT_BATCH,
+        k2.K2_OPT,
+    ]  # fmt: skip
+    layer_no = 0
+    for tag, reset in (("accumulate", False), ("reset", True)):
+        outs = {}
+        for opt in [0] + bits:
+            epoch[0].add_(1)
+            layer_no += 1
+            o, p, _ = run(
+                k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
+                rank=rank, layer=layer_no, opt=opt, **served,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            outs[opt] = (o.clone(), p.clone())
+        for opt in bits:
+            same = torch.equal(outs[0][0], outs[opt][0]) and torch.equal(
+                outs[0][1], outs[opt][1]
+            )
+            if rank == 0:
+                print(f"opt/{tag}: {opt} == 0 bit for bit: {same}", flush=True)
+            if not same:
+                fails.append(f"opt{opt}/{tag}")
+
+    # A graph of two launches (as a step's layers alternate) under every bit,
+    # replayed: each replay bit for bit the eager pair.
+    def pair(opt):
+        o1, _, _ = run(
+            k2, w, scratch, reset=False, peers=peers, epoch=epoch,
+            rank=rank, layer=1, opt=opt, **served,
+        )  # fmt: skip
+        o2, _, _ = run(
+            k2, w, scratch, reset=False, peers=peers, epoch=epoch,
+            rank=rank, layer=2, opt=opt, **served,
+        )  # fmt: skip
+        return o1, o2
+
+    epoch[0].add_(1)
+    want = [o.clone() for o in pair(k2.K2_OPT)]
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = pair(k2.K2_OPT)
+    ok = True
+    for i in range(args.replays):
+        epoch[0].add_(1)
+        graph.replay()
+        if i % 10 == 0 or i == args.replays - 1:
+            torch.cuda.synchronize()
+            ok = ok and all(torch.equal(g, x) for g, x in zip(got, want))
+    if rank == 0:
+        print(f"opt {k2.K2_OPT}: {args.replays} replays bit for bit: {ok}", flush=True)
+    if not ok:
+        fails.append("opt replay")
 
     # The captured graph replays the launch. A replay must be bit for bit what
     # the eager launch produced, which is what makes the decode graph safe.

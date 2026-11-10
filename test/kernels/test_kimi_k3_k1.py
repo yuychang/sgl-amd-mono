@@ -247,7 +247,7 @@ class K1Case:
         self.x_dbg = torch.zeros(self.S, h, dtype=BF, device=device)
         self.proj_dbg = torch.zeros(self.S, kda.NPROJ, dtype=BF, device=device)
 
-    def run(self):
+    def run(self, init_pool=None, init_slot=None):
         kda = self.kda
         key = kda.KdaPreBuild(
             tokens=self.S,
@@ -262,7 +262,8 @@ class K1Case:
             write_idx=self.write_idx,
             wfmt=self.wfmt,
             state_bf16=self.state_bf16,
-            ring_len=self.ring_len,
+            ring=bool(self.ring_len),
+            init_committed=init_pool is not None,
         )
         scratch = torch.zeros(
             kda.scratch_bytes(key), dtype=torch.uint8, device=self.device
@@ -294,6 +295,8 @@ class K1Case:
             epoch=epoch,
             x_dbg=self.x_dbg,
             proj_dbg=self.proj_dbg,
+            rstate0=init_pool,
+            init_slot=init_slot,
         )
         torch.cuda.synchronize()
         return self
@@ -448,6 +451,35 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         print(f"seeded vs rolling: cos {cos:.6f} (equal={equal})")
         self.assertGreater(
             cos, COS_MIN, "seeding the window at offset 0 is not equivalent"
+        )
+
+    def test_initial_state_read_from_the_committed_pool(self):
+        """init_committed: the initial state comes from the committed pool at the
+        request's slot, the scratch's first row unread. The outputs and every
+        written state must be the staged launch's bit for bit. The scratch's
+        first row is corrupted first, so a kernel still reading it fails."""
+        staged = K1Case(self.device, num_acc=1).run()
+        slot0 = int(staged.st_idx[0, 0])
+        pooled = K1Case(self.device, num_acc=1)
+        pool = torch.zeros(
+            4, *pooled.rstate.shape[1:], dtype=torch.float32, device=self.device
+        )
+        pool[2] = pooled.rstate[slot0]
+        pooled.rstate[slot0] += 5.0
+        pooled.run(
+            init_pool=pool,
+            init_slot=torch.tensor([2], dtype=torch.int32, device=self.device),
+        )
+        self.assertTrue(
+            torch.equal(pooled.core_out, staged.core_out), "core_out differs"
+        )
+        rows = staged.st_idx[0].long()
+        self.assertTrue(
+            torch.equal(pooled.rstate[rows], staged.rstate[rows]),
+            "written states differ",
+        )
+        self.assertTrue(
+            torch.equal(pool[2], pooled.rstate_in[slot0]), "the pool was written"
         )
 
     def test_core_out_depends_on_the_initial_state(self):

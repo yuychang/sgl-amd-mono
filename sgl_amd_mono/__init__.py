@@ -9,6 +9,8 @@ their forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per I
 entry point in ``pyproject.toml``), which registers each spec.
 """
 
+import os
+
 __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
@@ -25,12 +27,22 @@ SPECS = {
     ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
     ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
     ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
+    ("GlmMoeDsaForCausalLMNextN", None): "sgl_amd_mono.glm53.draft:SPEC",
     ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax.spec:SPEC",
     (
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
     ("KimiK3ForConditionalGeneration", None): "sgl_amd_mono.kimi_k3.spec:SPEC",
+    ("KimiK31ForConditionalGeneration", None): "sgl_amd_mono.kimi_k31.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    (
+        "Qwen4ExpForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
+    ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
+    ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -53,3 +65,11 @@ def register_specs() -> None:
         register(
             backend=BACKEND, architecture=architecture, path=path, model_type=model_type
         )
+
+    # SGLANG_AMD_MONO_ROCM_LLVM=<llvm prefix, e.g. /opt/rocm/llvm>: compile this
+    # package's kernels with that LLVM instead of FlyDSL's bundled one (common/rocm_codegen.py)
+    llvm_dir = os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM")
+    if llvm_dir:
+        from sgl_amd_mono.common import rocm_codegen
+
+        rocm_codegen.install(llvm_dir)

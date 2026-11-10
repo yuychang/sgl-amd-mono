@@ -26,11 +26,12 @@ import flydsl.expr as fx
 import msgspec
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
     CM_NT,
+    bf16_pair,
     bf16_round,
     fp8_to_bf16x8,
     ld_i32,
@@ -49,7 +50,18 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
+from sgl_amd_mono.common.sync import (
+    Mailbox,
+    preg,
+    put_sent,
+    rearm_sent,
+    sent_item,
+    sent_ix,
+    sent_sum,
+    sent_word,
+    shift,
+    sreg,
+)
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     COLS,
     HIDDEN,
@@ -232,6 +244,8 @@ def stage_o(c, rg, ops):
     """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
     rank's slot (thread: token, row pair; a put a peer)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    sent_ar = c.get("sent_ar", False)
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
     row = OK + LDS_PAD
@@ -263,9 +277,15 @@ def stage_o(c, rg, ops):
             row_sum(red, 2 * rp + 1, tt),
         )
         v0, v1 = bf16_round(v0), bf16_round(v1)
-        at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
-        for p in range_constexpr(TP):
-            c["put_bf"](c["ar_peer"][p], at, [v0, v1])
+        if const_expr(sent_ar):
+            si = sent_ix(c["rank"], rg * ROWS + 2 * rp, tt, s, HIDDEN)
+            word = sent_word(bf16_pair(v0, v1))
+            for p in range_constexpr(TP):
+                put_sent(c["ars_peer"][p], si, word)
+        else:
+            at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
+            for p in range_constexpr(TP):
+                c["put_bf"](c["ar_peer"][p], at, [v0, v1])
     gpu.barrier()
 
 
@@ -274,16 +294,37 @@ def stage_reduce(c, task):
     """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
     LDS (thread: token, column pair)."""
     s, tid = c["S"], c["tid"]
+    sent_ar = c.get("sent_ar", False)
     if tid < s * (COLS // 2):
-        t = tid // (COLS // 2)
-        cp = tid % (COLS // 2)
-        col = task * COLS + 2 * cp
-        lo, hi = sum_partials(
-            c["poll"], c["ar_own"], lambda src: ((src * s + t) * HIDDEN + col) // 2, TP
-        )
+        if const_expr(sent_ar):
+            # consecutive threads read consecutive words; re-armed after the mix
+            t, cp = sent_item(tid, s)
+            col = task * COLS + 2 * cp
+            lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
+        else:
+            t = tid // (COLS // 2)
+            cp = tid % (COLS // 2)
+            col = task * COLS + 2 * cp
+            lo, hi = sum_partials(
+                c["poll"],
+                c["ar_own"],
+                lambda src: ((src * s + t) * HIDDEN + col) // 2,
+                TP,
+            )
         fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
         fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
+
+
+@flyc.jit
+def rearm_ar(c, task):
+    """Re-arm the sentinel words ``stage_reduce`` read for ``task``: after the
+    mix, off the path to x."""
+    s, tid = c["S"], c["tid"]
+    if tid < s * (COLS // 2):
+        t, cp = sent_item(tid, s)
+        col = task * COLS + 2 * cp
+        rearm_sent(c["ars_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)])
 
 
 _BUILDS: dict = {}

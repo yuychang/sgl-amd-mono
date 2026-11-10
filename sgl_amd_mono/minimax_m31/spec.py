@@ -24,14 +24,25 @@ import re
 from contextlib import contextmanager
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.minimax_m31 import ffn
 
@@ -43,7 +54,7 @@ BLOCKS = 256
 
 # The SGLang names this glue reads, by file under the sglang package
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
         "Feature",
         "MonoSpec",
@@ -468,7 +479,7 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=model_disable_reasons,
     build=build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # the spec module's MONOKERNEL_API_VERSION
     config_disable_reasons=config_disable_reasons,
     load_tensor=load_tensor,
 )

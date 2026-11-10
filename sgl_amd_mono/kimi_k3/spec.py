@@ -43,6 +43,7 @@ launch once on real weights, not through FlyDSL's compile-only mode
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 from typing import Any
 
@@ -77,7 +78,19 @@ from sgl_amd_mono.kimi_k3 import (
     MAX_ROWS,
 )
 
+logger = logging.getLogger(__name__)
+
 TP_SIZE = 8
+# K2's OPT_* bits (gfx950/layer.py: sentinel all-reduces, preloads, tagged x rows,
+# router partials, batched polls), each bit for bit the launch without it; unset
+# is layer.K2_OPT, all of them.
+K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
+# The MLA (DSA) layers' projection front as one launch (gfx950/attention/mla_pre.py):
+# AttnRes, fused_qkv_a, the q / kv norms, q_b, g_proj and the indexer's wk,
+# weights_proj and wq_b, handed to SGLang's MLA forward and indexer.
+MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
+# SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
+K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -395,19 +408,6 @@ def _build(model, hf_config, ctx):
     return _Built(model, runner, layers, batches)
 
 
-def _k1_bank_rows(key) -> int:
-    """Bank rows K1's warmup tensor must hold.
-
-    ``nblocks`` counts the rows the seam reads. A block-write layer stores the
-    updated prefix at ``write_idx``, and that index is the count of rows
-    already valid, so it sits one past a tensor sized to ``nblocks``. The store
-    is not bounds-checked: a short bank overwrites the next allocation.
-    """
-    if key.write_idx >= 0:
-        return max(key.nblocks, key.write_idx + 1)
-    return key.nblocks
-
-
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
     """Launch every layer once at this width, before any graph capture."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -419,9 +419,16 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
     banks: dict[int, torch.Tensor] = {}
 
     def bank(nb: int):
+        # One row past the nb blocks the launch reads: a block-write layer's
+        # launch (K1 or mla_pre, key.write_idx == nb) stores its updated prefix
+        # in block nb, as a served step does into the bank's spare capacity.
+        # An nb-row bank put the last token's write one HIDDEN row past the end
+        # and zeroed whatever the allocator had placed there (seen: a later
+        # layer's indexer k_norm at 8 draft tokens, which silently broke that
+        # layer's DSA top-k).
         if nb not in banks:
             banks[nb] = torch.zeros(
-                rows, nb, HIDDEN, dtype=torch.bfloat16, device=device
+                rows, nb + 1, HIDDEN, dtype=torch.bfloat16, device=device
             )
         return banks[nb]
 
@@ -430,11 +437,17 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
         # waits pair up in the same order here as there.
         if packed.k1 is not None:
             k1_mod.warmup(
-                runner,
-                packed.k1,
-                runner.prefix[:rows],
-                bank(_k1_bank_rows(packed.k1.key)),
+                runner, packed.k1, runner.prefix[:rows], bank(packed.k1.key.nblocks)
             )
+        if packed.mla is not None:
+            from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+            key, w = packed.mla
+            mp.mla_pre_launch(
+                key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w,
+                out=_mla_outputs(rows, device), scratch=runner.scratch,
+                layer=packed.i, epoch=runner.epoch,
+            )  # fmt: skip
         _k2_launch(
             runner, packed, core, runner.prefix[:rows], bank(packed.key.nblocks), out
         )
@@ -571,6 +584,7 @@ class _Layer(msgspec.Struct):
     key: Any
     module: Any  # the KimiK3DecoderLayer, for the tensors read per step
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
+    mla: Any = None  # (MlaPreBuild, weights): an MLA layer's projection front
     # o_proj's storage and its FP8 scale (None for bf16): _o_proj_operands
     w_o: Any = None
     w_os: Any = None
@@ -587,12 +601,14 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+    from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
     ofmt, w_o, w_os = _o_proj_operands(layer.self_attn.o_proj)
     return _Layer(
-        k1=k1_mod.build(layer, i, rows),
+        k1=k1_mod.build(layer, i, rows) if K1 else None,
+        mla=_mla_build(layer, rows) if MLA_PRE else None,
         i=i,
         key=K2Build(
             tokens=rows,
@@ -601,6 +617,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             out_eps=layer.post_attention_layernorm.variance_epsilon,
             ln_eps=moe.routed_expert_norm.variance_epsilon,
             reset=layer.is_block_write_layer,
+            opt=k2.K2_OPT if K2_OPT is None else int(K2_OPT),
             guint=_gu_interleaved(moe),
             ofmt=ofmt,
             fault_site=runner.fault_site,
@@ -610,6 +627,88 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
         w_o=w_o,
         w_os=w_os,
     )
+
+
+def _mla_build(layer, rows: int):
+    """An MLA layer's projection-front key and the weights it reads in place, or
+    None (a KDA layer, or weights the launch does not take: SGLang's path)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    attn = layer.self_attn
+    idx = getattr(attn, "indexer", None)
+    fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+    if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
+        return None
+    if get_parallel().attn_dcp_size > 1:
+        # under DCP SGLang's MLA forward computes every head's q itself (the
+        # replicated q_b); the front hands over this rank's 12
+        return None
+    w = {
+        "ares_nw": layer.self_attention_res_norm.weight,
+        "ares_qk": layer.self_attention_res_proj.weight.view(HIDDEN),
+        "in_nw": layer.input_layernorm.weight,
+        "w_qkv": fused.weight,
+        "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
+        "w_k": getattr(getattr(idx, "wk", None), "weight", None),
+        "w_p": getattr(getattr(idx, "weights_proj", None), "weight", None),
+        "w_qb": attn.q_b_proj.weight,
+        "w_iq": getattr(getattr(idx, "wq_b", None), "weight", None),
+        "q_nw": attn.q_a_layernorm.weight,
+        "kv_nw": attn.kv_a_layernorm.weight,
+    }
+    want = {
+        "w_qkv": (mp.LATW, HIDDEN), "w_g": (mp.GATE, HIDDEN), "w_k": (mp.IK, HIDDEN),
+        "w_p": (mp.IW, HIDDEN), "w_qb": (mp.QB, mp.QL), "w_iq": (mp.IQ, mp.QL),
+    }  # fmt: skip
+    for n, shp in want.items():
+        t = w[n]
+        if (
+            not isinstance(t, torch.Tensor)
+            or t.dtype != torch.bfloat16
+            or tuple(t.shape) != shp
+            or not t.is_contiguous()
+        ):
+            logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+            return None
+    # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
+    wkc, wsc = getattr(attn, "w_kc", None), getattr(attn, "w_scale", None)
+    qn = (
+        isinstance(wkc, torch.Tensor)
+        and wkc.dtype == torch.bfloat16
+        and tuple(wkc.shape) == (mp.NHQ, mp.QN, mp.KV)
+        and isinstance(wsc, (int, float))
+        and wsc == 1.0
+    )
+    if qn:
+        w["w_kc"] = wkc.transpose(1, 2).contiguous().view(mp.NHQ * mp.KV, mp.QN)
+    key = mp.MlaPreBuild(
+        tokens=rows,
+        qn=qn,
+        nblocks=layer.prev_valid_blocks,
+        eps=layer.self_attention_res_norm.variance_epsilon,
+        out_eps=layer.input_layernorm.variance_epsilon,
+        q_eps=attn.q_a_layernorm.variance_epsilon,
+        kv_eps=attn.kv_a_layernorm.variance_epsilon,
+        write_idx=(layer.prev_valid_blocks if layer.is_block_write_layer else -1),
+    )
+    return (key, w)
+
+
+def _mla_outputs(rows: int, device) -> dict:
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+    def z(n):
+        return torch.zeros(rows, n, dtype=torch.bfloat16, device=device)
+
+    return {
+        "q": z(mp.QB), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV),
+        "q_lora": z(mp.QL), "gate": z(mp.GATE), "idx_q": z(mp.IQ),
+        "idx_k": z(mp.IK), "idx_w": z(mp.IW),
+        "qn": torch.zeros(rows, mp.NHQ, mp.KV, dtype=torch.bfloat16, device=device),
+    }  # fmt: skip
 
 
 def _gu_interleaved(moe) -> bool:
@@ -638,7 +737,9 @@ def _up_shard(moe, rank: int):
     return moe.routed_expert_up_proj.weight.narrow(0, rank * UP_N, UP_N)
 
 
-def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out) -> None:
+def _k2_launch(
+    runner, packed: _Layer, core, prefix, blocks, out, prefix_in=None
+) -> None:
     """The launch itself: this layer's weights read in place, the activations
     the caller owns."""
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
@@ -668,6 +769,7 @@ def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out) -> None:
         ln_w=moe.routed_expert_norm.weight,
         w_up=_up_shard(moe, runner.rank),
         out=out,
+        prefix_in=prefix_in,
         **runner.launch_args(),
         # One tag a layer: a layer takes at most one launch in a step.
         layer=128 + packed.i,
@@ -687,13 +789,11 @@ def _launch(runner, packed: _Layer, attn_res, core, forward_batch):
     )
     _check(packed, core, prefix_sum, attn_res, rows)
     prefix = runner.prefix[:rows]
-    if prefix_sum is not None:
-        # Not ``prefix = prefix_sum``: that tensor is the residual stream's,
-        # lent out read-only, and the kernel updates its prefix in place.
-        prefix.copy_(prefix_sum)
     out = torch.empty_like(prefix)
-    _k2_launch(runner, packed, core, prefix, attn_res.block_residual, out)
-    return out + prefix
+    # The kernel reads the stream from prefix_sum (lent out read-only), updates its
+    # own prefix and writes out + prefix itself.
+    _k2_launch(runner, packed, core, prefix, attn_res.block_residual, out, prefix_sum)
+    return out
 
 
 def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:
@@ -731,6 +831,24 @@ def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:
         and bank.size(2) == HIDDEN
         and bank.stride(2) == 1
     ), (bank.dtype, tuple(bank.shape), bank.stride())
+
+
+def _mla_covered(packed, hidden, bank) -> bool:
+    """The MLA front takes a layer whose stream is a written tensor (not an owed
+    contribution), with its bank open at the row count it was built for."""
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    key, _ = packed.mla
+    return (
+        bank is not None
+        and isinstance(hidden, torch.Tensor)
+        and hidden.dtype == torch.bfloat16
+        and hidden.is_contiguous()
+        and hidden.dim() == 2
+        and hidden.shape[1] == HIDDEN
+        and bank.num_valid_blocks == key.nblocks
+        and bank.block_residual.dtype == torch.bfloat16
+    )
 
 
 class _LanguageModelShim:
@@ -774,6 +892,13 @@ class _Built:
         # The conv windows waiting for finish(), under that flag only.
         self._check_handoff = []
         self._shim = _LanguageModelShim(self)
+        # The MLA front's outputs, one set a width (the layers run in sequence)
+        dev = runner.device
+        self._mla_out = {
+            rows: _mla_outputs(rows, dev)
+            for rows, packed in by_width.items()
+            if any(p.mla is not None for p in packed.values())
+        }
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
         """``KimiK3ForConditionalGeneration.forward`` for a routed step: SGLang's
@@ -893,6 +1018,10 @@ class _Built:
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
 
         state = self._k1_state
+        if packed.mla is not None and _mla_covered(packed, hidden, bank):
+            return self._mla_core(
+                layer, packed, hidden, bank, forward_batch, zero_allocator
+            )
         if packed.k1 is not None and k1_mod.covered(packed.k1, hidden, bank, state):
             ref = None
             if self._check:
@@ -912,6 +1041,47 @@ class _Built:
             return core
         x = layer.attn_boundary.prepare(hidden, forward_batch, capture_gathered=None)
         return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
+
+    def _mla_core(self, layer, packed, hidden, bank, forward_batch, zero_allocator):
+        """An MLA layer: the projection front as one launch, then SGLang's MLA
+        forward (RoPE, the KV write, the indexer's norms / quantization / logits /
+        top-k, the sparse attention) on its outputs, up to o_proj's input."""
+        from sglang.srt.layers.layer_boundary.residual.batch import set_written
+
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+        from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+        key, w = packed.mla
+        rows = hidden.shape[0]
+        out = self._mla_out[rows]
+        # The launch reads the stream and does not add to it, as K1 does.
+        set_written(hidden, forward_batch)
+        mp.mla_pre_launch(
+            key, prefix=hidden, blocks=bank.block_residual, w=w, out=out,
+            scratch=self.runner.scratch, layer=packed.i, epoch=self.runner.epoch,
+        )  # fmt: skip
+        if key.write_idx >= 0:
+            bank._count_write(None)  # the launch wrote the bank row
+        off, nbytes = mp.scratch_layout(key)["x"]
+        x = (
+            self.runner.scratch[off : off + nbytes]
+            .view(torch.bfloat16)
+            .view(rows, HIDDEN)
+        )
+        attn = layer.self_attn
+        attn.__dict__["_mono_pre"] = {
+            "q": out["q"], "latent": out["latent"], "k_nope": out["k_nope"],
+            "q_lora": out["q_lora"], "gate": out["gate"],
+            "q_nope_out": out["qn"] if key.qn else None,
+        }  # fmt: skip
+        attn.indexer.__dict__["_mono_pre"] = {
+            "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
+        }  # fmt: skip
+        try:
+            return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
+        finally:
+            attn.__dict__.pop("_mono_pre", None)
+            attn.indexer.__dict__.pop("_mono_pre", None)
 
     def _pre_o_proj(self, layer, x, forward_batch, zero_allocator):
         """``KimiK3DecoderLayer._run_self_attn`` stopped before o_proj: the

@@ -3,7 +3,7 @@
 and the gfx950 kernels and host runner in ``gfx950``.
 
 Adapted from vLLM PR #60683, whose shared stages come from ROCm/ATOM
-(https://github.com/ROCm/ATOM); each file names its origin.
+(https://github.com/ROCm/ATOM).
 """
 
 # Kimi-K3's shapes and routing, which the kernels build in. These live on the

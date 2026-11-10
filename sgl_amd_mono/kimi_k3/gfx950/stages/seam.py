@@ -63,27 +63,74 @@ def sum_polled(vals):
 
 
 # ---------------------------------------------------------------- attn CTAs
+def _raw4(ptr, i):
+    """bf16 elements i .. i + 4 (i a multiple of 4) as two raw words."""
+    return fx.Vector(bo.buffer_load(rsrc(ptr), i // 2, vec_width=2, dtype=T.i32))
+
+
+def _f4(w):
+    return [bf_lo(w[0]), bf_hi(w[0]), bf_lo(w[1]), bf_hi(w[1])]
+
+
+def _slice_item(c, task, i):
+    """Round i's work item of this thread: (live, row, token, source, column)."""
+    s, ns, tid = c["S"], c["NS"], c["tid"]
+    n = s * ns * QC
+    e = fx.min(tid + THREADS * i, n - 1)
+    row = e // QC  # (token, source)
+    t = row // ns
+    return (tid + THREADS * i) < n, e, row, t, row % ns, task * COLS + (e % QC) * 4
+
+
+def slice_loads(c, task):
+    """``stage_slice``'s loads that wait on nothing in this launch: every round's
+    block and incoming-prefix words, and the norm / qk words (the same columns
+    every round: THREADS % QC == 0). K2 issues them before the o_proj poll."""
+    s, ns, nb = c["S"], c["NS"], c["NB"]
+    a = c["args"]
+    pre_in = a["prefix_in"] if "prefix_in" in a else a["prefix"]
+    blk, pre = [], []
+    for i in range((s * ns * QC + THREADS - 1) // THREADS):
+        _, _, _, t, src, col = _slice_item(c, task, i)
+        blk.append(
+            _raw4(
+                a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
+            )
+        )
+        pre.append(_raw4(pre_in, t * HIDDEN + col))
+    _, _, _, _, _, col = _slice_item(c, task, 0)
+    return {
+        "blk": blk,
+        "pre": pre,
+        "w": _raw4(a["ares_nw"], col),
+        "q": _raw4(a["ares_qk"], col),
+    }
+
+
 @flyc.jit
-def stage_slice(c, task):
+def stage_slice(c, task, ld=None):
     """Columns 128 task ..: every token's sources into LDS ``vals`` (4 columns a
     thread), the prefix (+ delta) rounded to bf16 and stored back, per-(token,
-    source) partial sum of squares and qk dot -> PART."""
-    s, ns, nb, tid, lane = c["S"], c["NS"], c["NB"], c["tid"], c["lane"]
+    source) partial sum of squares and qk dot -> PART. ``ld``: the loads
+    ``slice_loads`` issued earlier (else each round loads its own)."""
+    s, ns, nb, lane = c["S"], c["NS"], c["NB"], c["lane"]
     a = c["args"]
-    c0 = task * COLS
+    # the incoming prefix; K2 under ``fold`` reads it where the stream left it
+    pre_in = a["prefix_in"] if "prefix_in" in a else a["prefix"]
+    # under ``fold`` the reduce CTAs read the updated prefix back: store it
+    # device-coherent (they may sit on another XCD)
+    pre_cm = CM_DEV if c.get("fold", False) else 0
     n = s * ns * QC  # threads' work items
     for i in range_constexpr((n + THREADS - 1) // THREADS):
-        e = fx.min(tid + THREADS * i, n - 1)
-        live = (tid + THREADS * i) < n
-        row = e // QC  # (token, source)
-        t = row // ns
-        src = row % ns
-        col = c0 + (e % QC) * 4
+        live, e, row, t, src, col = _slice_item(c, task, i)
         is_pre = src == nb
-        blk = ld_bf4(
-            a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
-        )
-        pre = ld_bf4(a["prefix"], t * HIDDEN + col)
+        if const_expr(ld is None):
+            blk = ld_bf4(
+                a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
+            )
+            pre = ld_bf4(pre_in, t * HIDDEN + col)
+        else:
+            blk, pre = _f4(ld["blk"][i]), _f4(ld["pre"][i])
         if const_expr(c["delta"]):
             if const_expr(c.get("delta_lds") is not None):
                 # the delta reduced into LDS first (K2a: the all-reduced o_proj)
@@ -101,7 +148,10 @@ def stage_slice(c, task):
                 pre = [bf16r(pre[j] + dl[j]) for j in range(4)]
             if live & is_pre:
                 bo.buffer_store(
-                    bf4_words(pre), rsrc(a["prefix"]), (t * HIDDEN + col) // 2
+                    bf4_words(pre),
+                    rsrc(a["prefix"]),
+                    (t * HIDDEN + col) // 2,
+                    cache_modifier=pre_cm,
                 )
         if const_expr(c.get("write_idx", -1) >= 0):  # noqa: SIM102 (traced: `and` does not combine traced values)
             # the block-write layer's attention seam: the updated prefix is
@@ -116,8 +166,11 @@ def stage_slice(c, task):
             live.select(is_pre.select(pre[j], blk[j]), fx.Float32(0.0))
             for j in range(4)
         ]
-        w = ld_bf4(a["ares_nw"], col)
-        q = ld_bf4(a["ares_qk"], col)
+        if const_expr(ld is None):
+            w = ld_bf4(a["ares_nw"], col)
+            q = ld_bf4(a["ares_qk"], col)
+        else:
+            w, q = _f4(ld["w"]), _f4(ld["q"])
         # a thread past the end holds a clamped copy of the last element: it
         # must not store (it raced the owner with zeros)
         if live:
@@ -246,6 +299,8 @@ def stage_mix(c, task):
     the plain x rows, and the slice's XRDY flag."""
     s, ns, tid, lane, red = c["S"], c["NS"], c["tid"], c["lane"], c["red"]
     a = c["args"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    tag_x = c.get("tag_x", False)
     c0 = task * COLS
     nw = s * (ns + 1)
     if const_expr(c.get("gate_local", False)):
@@ -290,6 +345,9 @@ def stage_mix(c, task):
     xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
     if mine:
         at = (t * HIDDEN + c0 + cc) // 2
+        if const_expr(tag_x):
+            # also as tagged pairs: the router and latent GEMVs poll these, not XRDY
+            c["put_words"](c["xt"], at, [xw[0], xw[1]])
         bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
         if const_expr(c["debug"]):
             bo.buffer_store(xw, rsrc(a["x_dbg"]), at)

@@ -265,16 +265,17 @@ def test_k1_builds_for_replayssm_and_a_bf16_state(monkeypatch):
     mamba = SimpleNamespace(
         mamba_ssm_dtype="bfloat16",
         enable_linear_replayssm_spec=True,
-        linear_replayssm_cache_len=16,
     )
     monkeypatch.setattr(
         runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
     )
-    assert k1._state_config() == (True, 16, [])
+    assert k1._state_config() == (True, [])
+    assert k1._ring_mode()
     mamba.mamba_ssm_dtype, mamba.enable_linear_replayssm_spec = "float32", False
-    assert k1._state_config() == (False, 0, [])
+    assert k1._state_config() == (False, [])
+    assert not k1._ring_mode()
     mamba.mamba_ssm_dtype = "float16"
-    assert "float32 or bfloat16" in k1._state_config()[2][0]
+    assert "float32 or bfloat16" in k1._state_config()[1][0]
 
 
 def test_padded_experts_are_refused(monkeypatch):

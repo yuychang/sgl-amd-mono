@@ -46,6 +46,7 @@ from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, NA
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    slice_loads,
     stage_gate,
     stage_mix,
     stage_slice,
@@ -69,11 +70,35 @@ SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 17  # + 14 (unused), 15 INTER loaded, 16 down done
+TL_POINTS = 25  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
-REGIONS = ("part", "wgt", "msq", "xrdy", "ar") + k2b.REGIONS
+REGIONS = (
+    ("part", "wgt", "msq", "xrdy", "ar")
+    + k2b.REGIONS
+    + (
+        "ars",
+        "latrs",
+        "finals",
+        "xt",
+    )
+)
+
+# K2 options (``K2Build.opt``), each bit for bit the launch without it:
+OPT_SENT = 1  # o_proj's all-reduce through a sentinel region (sync.put_sent)
+OPT_PRELOAD = 2  # the seam's block / prefix / norm loads before that poll
+OPT_TAG_X = 8  # x rows also as tagged pairs to the router / latent GEMVs: no XRDY
+OPT_SENT_LATR = 16  # the latent all-reduce through a sentinel region
+OPT_SENT_FINAL = 32  # the final all-reduce through a sentinel region
+OPT_SDOWN_FIRST = 64  # the shared-down tasks up waits on before the others
+OPT_RLOG_PARTS = 256  # every router part pushes its partial: no part-0 sum hop
+OPT_BATCH = 512  # the route's, down's and up's polls in one batch each
+OPT_SENTS = OPT_SENT | OPT_SENT_LATR | OPT_SENT_FINAL
+K2_OPT = (
+    OPT_SENTS | OPT_PRELOAD | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
+)
+NARROW_ROWS = 8  # this launch's widest step: the sentinel and tagged rows' size
 
 _STREAM = fx.Stream(None)
 
@@ -86,6 +111,10 @@ class K2Build(msgspec.Struct, frozen=True):
     ln_eps: float = 1e-5  # the latent RMSNorm
     reduce: bool = True  # the final reduce here (else the next layer's K1)
     reset: bool = False  # a block-write layer: the prefix restarts at the o_proj output
+    # the reduce writes out + the updated prefix (the layer's residual stream), and
+    # the seam reads the incoming prefix from ``prefix_in``: no copy in, no add out.
+    # False (the kernel checks): out is the MoE output alone
+    fold: bool = True
     timeline: bool = False
     # fault injection (tests only): the wait to stall and how many launches
     # to let through first. Compile-time, so a serving build pays nothing.
@@ -93,6 +122,7 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
+    opt: int = 0  # the OPT_* bits
     ofmt: int = k2a.O_BF16  # o_proj's weight format; see stages.oproj.O_BF16
 
 
@@ -120,6 +150,72 @@ def flags_offset() -> int:
     live data for an error word, and stops every rank.
     """
     return max(peer_bytes(MAX_ROWS), k2b.peer_bytes(MAX_ROWS))
+
+
+def sent_layout() -> dict:
+    """One layer parity's sentinel regions, name -> (byte offset, bytes): a word
+    a (rank, bf16 pair, row), NARROW_ROWS rows."""
+    sizes = {
+        "ars": TP_ * NARROW_ROWS * HIDDEN // 2 * 4,
+        "latrs": TP_ * NARROW_ROWS * k2b.LAT // 2 * 4,
+        "finals": TP_ * NARROW_ROWS * HIDDEN // 2 * 4,
+    }
+    out, off = {}, 0
+    for name, n in sizes.items():
+        out[name] = (off, n)
+        off += -(-n // 256) * 256
+    return out
+
+
+def sent_half_bytes() -> int:
+    return max(o + n for o, n in sent_layout().values())
+
+
+def sent_offset() -> int:
+    """Where the sentinel regions start in a rank's peer buffer: past the guard
+    flags, two layer parities. A word is pushed again two layers later, after
+    a launch in between that its reader's rank finished first."""
+    return -(-(flags_offset() + guard.FLAG_BYTES) // 4096) * 4096
+
+
+def peer_alloc_bytes() -> int:
+    """A rank's peer buffer: the parity halves, the guard flags, the sentinels."""
+    return sent_offset() + 2 * sent_half_bytes()
+
+
+# set by init_peer: a launch using the sentinel regions without it would read
+# zeros as words that came
+SENT_READY = False
+
+
+def init_peer(buf: torch.Tensor) -> None:
+    """Zero a rank's peer buffer (``peer_alloc_bytes``) and arm its sentinels."""
+    global SENT_READY
+    buf.zero_()
+    buf[sent_offset() : peer_alloc_bytes()].fill_(0xFF)
+    SENT_READY = True
+
+
+def tag_offset() -> int:
+    """Where the tagged x rows (OPT_TAG_X) start in the scratch: past every
+    launch's layout at its widest, so no other launch's plain word sits where
+    these keep tags."""
+    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre
+
+    end = max(
+        k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
+        scratch_bytes(K2Build(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
+        k1.scratch_bytes(MAX_ROWS),
+        mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
+    )
+    return -(-end // 4096) * 4096
+
+
+def scratch_alloc_bytes() -> int:
+    """The scratch every Kimi-K3 launch on a rank shares, tagged x rows included."""
+    return tag_offset() + NARROW_ROWS * HIDDEN // 2 * 8
 
 
 def scratch_layout(key: K2Build) -> dict:
@@ -192,12 +288,17 @@ def build(key: K2Build):
         intsc: fx.Array[fx.Int32, s * k2b.TOPK * k2b.UG_GROUPS, 16]
         contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
 
+    @fx.struct
+    class PartsLds:
+        rlp: fx.Array[fx.Float32, k2b.R_PARTS * k2b.E, 16]
+
     @fx.union
     class StageLds:
         early: EarlyLds
         attn: AttnLds
         ug: UgLds
         down: DownLds
+        parts: PartsLds  # the route's router parts (OPT_RLOG_PARTS), after the mix
 
     @fx.struct
     class Smem:
@@ -207,7 +308,10 @@ def build(key: K2Build):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
-        f"_t{int(key.timeline)}_o{key.ofmt}"
+        f"_t{int(key.timeline)}"
+        + ("_f1" if key.fold else "")
+        + (f"_o{key.opt}" if key.opt else "")
+        + (f"_w{key.ofmt}" if key.ofmt != k2a.O_BF16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -216,6 +320,7 @@ def build(key: K2Build):
         w_o: Int64,
         w_os: Int64,
         prefix: Int64,
+        prefix_in: Int64,
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
@@ -266,17 +371,18 @@ def build(key: K2Build):
             lds = alloc.allocate(Smem).peek()
             rl = alloc.allocate(RouteLds).peek()
             st = alloc.allocate(StageLds)
-            el, al, ul, dl = (
+            el, al, ul, dl, pl = (
                 st.early.peek(),
                 st.attn.peek(),
                 st.ug.peek(),
                 st.down.peek(),
+                st.parts.peek(),
             )
             mb = Mailbox(step_tag(epoch, layer))
             par = uniform(ld_i32(epoch, 0)) % 2
             bases = peer_bases(peers, TP_)
             peer = {}
-            for region in ("rlog", "lat", "latr", "final", "ar"):
+            for region in ("rlog", "lat", "latq", "latr", "final", "ar", "rlogp"):
                 off = play[region][0]
                 peer[region] = [
                     shift(preg(b, off, region), fx.Int64(par) * half) for b in bases
@@ -295,6 +401,11 @@ def build(key: K2Build):
                 "rank": rank,
                 "delta": True,
                 "reset": key.reset,
+                "fold": key.fold,
+                # the top-16 by candidate rank; the latent quantized to MXFP4 by
+                # its producers and pushed to every rank
+                "route_v": 2,
+                "latq_push": True,
                 "gate_local": False,
                 "debug": False,
                 "eps": key.eps,
@@ -339,6 +450,7 @@ def build(key: K2Build):
                     "w_o": w_o,
                     "w_os": w_os,
                     "prefix": prefix,
+                    "prefix_in": prefix_in,
                     "blocks": blocks,
                     "blk_sm": blk_sm,
                     "blk_sr": blk_sr,
@@ -360,6 +472,25 @@ def build(key: K2Build):
                     "out": out,
                 },
             }
+            c["rlp"] = pl.rlp.ptr
+            c["tag_x"] = bool(key.opt & OPT_TAG_X)
+            c["rlog_parts"] = bool(key.opt & OPT_RLOG_PARTS)
+            c["batch"] = bool(key.opt & OPT_BATCH)
+            if const_expr(key.opt & OPT_TAG_X):
+                c["xt"] = sreg(scratch, tag_offset(), "xt")
+            c["sent_ar"] = bool(key.opt & OPT_SENT)
+            c["sent_latr"] = bool(key.opt & OPT_SENT_LATR)
+            # the K1 that takes a deferred reduce reads tagged pairs
+            c["sent_final"] = bool(key.opt & OPT_SENT_FINAL) and key.reduce
+            if const_expr(key.opt & OPT_SENTS):
+                # this layer parity's copy
+                lpar = fx.Int64(layer % 2) * sent_half_bytes()
+                for region, (roff, _) in sent_layout().items():
+                    off = sent_offset() + roff
+                    c[region + "_peer"] = [
+                        shift(preg(b, off, region), lpar) for b in bases
+                    ]
+                    c[region + "_own"] = shift(preg(own, off, region), lpar)
             for region in (
                 "part",
                 "wgt",
@@ -394,8 +525,8 @@ def build(key: K2Build):
             if is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)
-                lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
-                k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
+                lops = k2b.early_loads(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS)
+                k2b.early_compute(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS, lops)
             if (bid >= O0) & ~is_r & ~is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)
@@ -404,14 +535,19 @@ def build(key: K2Build):
                     k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
             # ---- AttnRes: the reduced o_proj -> x; then route / SiTU
             if bid < NA:
+                # PRELOAD: the slice's loads in flight across the o_proj poll
+                sld = slice_loads(c, bid) if key.opt & OPT_PRELOAD else None
                 k2a.stage_reduce(c, bid)
                 stamp(on, tls, tid, 1)
-                stage_slice(c, bid)
+                stage_slice(c, bid, sld)
                 stamp(on, tls, tid, 2)
                 if bid < s:
                     stage_gate(c, bid)
                 stamp(on, tls, tid, 8)
                 stage_mix(c, bid)
+                if const_expr(key.opt & OPT_SENT):
+                    # the words stage_reduce took, off the path to x
+                    k2a.rearm_ar(c, bid)
                 stamp(on, tls, tid, 9)
                 stamp(on, tls, tid, 13)
                 if bid < s:
@@ -425,7 +561,8 @@ def build(key: K2Build):
             # the latent (ready ~10 us before the route) quantized first
             k2b.load_latq(c)
             stamp(on, tls, tid, 12)
-            nu = k2b.load_route(c)
+            # the route table from a bitmask's wave scan
+            nu = k2b.load_route2(c)
             stamp(on, tls, tid, 11)
             total = nu * k2b.UG_GROUPS
             last = total - 1
@@ -446,8 +583,12 @@ def build(key: K2Build):
                 stamp(on, tls, tid, 15)
                 k2b.stage_down(c, bid, nu, dops)
                 stamp(on, tls, tid, 16)
-            k2b.run_sdown_rest(c, bid, w_sd)
-            k2b.run_sdown(c, bid, w_sd)
+            if const_expr(key.opt & OPT_SDOWN_FIRST):
+                k2b.run_sdown_first(c, bid, w_sd)
+                k2b.run_sdown_rest(c, bid, w_sd)
+            else:
+                k2b.run_sdown_rest(c, bid, w_sd)
+                k2b.run_sdown(c, bid, w_sd)
             stamp(on, tls, tid, 4)
             if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
                 k2b.stage_lnorm(c, bid - k2b.LN0)
@@ -467,6 +608,7 @@ def build(key: K2Build):
         w_o: Int64,
         w_os: Int64,
         prefix: Int64,
+        prefix_in: Int64,
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
@@ -499,6 +641,7 @@ def build(key: K2Build):
             w_o,
             w_os,
             prefix,
+            prefix_in,
             blocks,
             blk_sm,
             blk_sr,
@@ -564,12 +707,14 @@ def k2_launch(
     epoch,
     layer,
     tl=None,
+    prefix_in=None,
     w_os=None,
 ):
     """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
-    place, ``out`` the MoE output [S, 7168]; MoE weights as ``moe``. ``w_o`` is
-    o_proj's [7168, 1536] storage in ``key.ofmt``, and ``w_os`` its fp32 scale a
-    row when that is FP8."""
+    place (read from ``prefix_in`` when given), ``out`` the MoE output [S, 7168]
+    (plus the updated prefix under ``key.fold``); MoE weights as ``moe``. ``w_o``
+    is o_proj's [7168, 1536] storage in ``key.ofmt``, and ``w_os`` its fp32 scale
+    a row when that is FP8."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
         and w_o.is_contiguous()
@@ -587,12 +732,17 @@ def k2_launch(
             and w_os.is_contiguous()
         )
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
+    assert SENT_READY or not key.opt & OPT_SENTS, "OPT_SENTS without init_peer"
+    assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (
+        "OPT_TAG_X without scratch_alloc_bytes of scratch"
+    )
     f = build(key)
     f(
         core.data_ptr(),
         w_o.data_ptr(),
         ptr(w_os),
         prefix.data_ptr(),
+        (prefix if prefix_in is None else prefix_in).data_ptr(),
         blocks.data_ptr(),
         blocks.stride(0),
         blocks.stride(1),
