@@ -118,7 +118,8 @@ SGLANG_READS = {
         "use_aiter_bpreshuffle_gemm",
         "use_aiter_bpreshuffle_gemm(output_size)",
     ),
-    # mlp-sync padding, which the launch has no handling for
+    # mlp-sync padding, which the launch has no handling for (in
+    # srt/utils/common.py before sgl-project/sglang#48781)
     "srt/layers/dp_attention.py": ("require_mlp_sync",),
     "srt/utils/common.py": (
         "BumpAllocator",
@@ -302,7 +303,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
     were the expected one."""
-    from sglang.srt.layers.dp_attention import require_mlp_sync
+    try:
+        from sglang.srt.layers.dp_attention import require_mlp_sync
+    except ImportError:  # SGLang before sgl-project/sglang#48781
+        from sglang.srt.utils.common import require_mlp_sync
 
     from sgl_amd_mono.kimi_k3.gfx950.stages.moe import LAT, RI, E
 

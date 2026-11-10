@@ -457,30 +457,37 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         """init_committed: the initial state comes from the committed pool at the
         request's slot, the scratch's first row unread. The outputs and every
         written state must be the staged launch's bit for bit. The scratch's
-        first row is corrupted first, so a kernel still reading it fails."""
-        staged = K1Case(self.device, num_acc=1).run()
-        slot0 = int(staged.st_idx[0, 0])
-        pooled = K1Case(self.device, num_acc=1)
-        pool = torch.zeros(
-            4, *pooled.rstate.shape[1:], dtype=torch.float32, device=self.device
-        )
-        pool[2] = pooled.rstate[slot0]
-        pooled.rstate[slot0] += 5.0
-        pooled.run(
-            init_pool=pool,
-            init_slot=torch.tensor([2], dtype=torch.int32, device=self.device),
-        )
-        self.assertTrue(
-            torch.equal(pooled.core_out, staged.core_out), "core_out differs"
-        )
-        rows = staged.st_idx[0].long()
-        self.assertTrue(
-            torch.equal(pooled.rstate[rows], staged.rstate[rows]),
-            "written states differ",
-        )
-        self.assertTrue(
-            torch.equal(pool[2], pooled.rstate_in[slot0]), "the pool was written"
-        )
+        first row is corrupted first, so a kernel still reading it fails. With
+        a bf16 state (--mamba-ssm-dtype bfloat16) the pool is read as bf16."""
+        for state_bf16 in (False, True):
+            with self.subTest(state_bf16=state_bf16):
+                staged = K1Case(self.device, num_acc=1, state_bf16=state_bf16).run()
+                slot0 = int(staged.st_idx[0, 0])
+                pooled = K1Case(self.device, num_acc=1, state_bf16=state_bf16)
+                pool = torch.zeros(
+                    4,
+                    *pooled.rstate.shape[1:],
+                    dtype=pooled.rstate.dtype,
+                    device=self.device,
+                )
+                pool[2] = pooled.rstate[slot0]
+                pooled.rstate[slot0] += 5.0
+                pooled.run(
+                    init_pool=pool,
+                    init_slot=torch.tensor([2], dtype=torch.int32, device=self.device),
+                )
+                self.assertTrue(
+                    torch.equal(pooled.core_out, staged.core_out), "core_out differs"
+                )
+                rows = staged.st_idx[0].long()
+                self.assertTrue(
+                    torch.equal(pooled.rstate[rows], staged.rstate[rows]),
+                    "written states differ",
+                )
+                self.assertTrue(
+                    torch.equal(pool[2], pooled.rstate_in[slot0]),
+                    "the pool was written",
+                )
 
     def test_core_out_depends_on_the_initial_state(self):
         """Control: the recurrence must actually read the slot it selects.

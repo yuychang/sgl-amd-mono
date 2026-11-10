@@ -143,6 +143,8 @@ SGLANG_READS = {
         "replayssm_rawk",
         "replayssm_g",
         "replayssm_beta",
+        # the request-scoped ring, which prepare() declines
+        "replayssm_request_ring",
     ),
     "srt/runtime_context.py": ("get_exec",),
     # the server configuration K1's state handling rules out

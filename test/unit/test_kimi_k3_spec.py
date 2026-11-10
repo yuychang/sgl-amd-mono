@@ -163,6 +163,22 @@ def _reasons(monkeypatch, layer):
     return k3._model_disable_reasons(model, K3, {})
 
 
+def test_require_mlp_sync_is_read_from_utils_common_on_an_older_sglang(monkeypatch):
+    # Before sgl-project/sglang#48781 SGLang defines it in srt/utils/common.py and
+    # not in dp_attention; the checks must still run there, and still refuse.
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.utils import common
+
+    monkeypatch.delattr(dp_attention, "require_mlp_sync", raising=False)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers={i: _fake_layer() for i in range(93)})
+    )
+    for on in (False, True):
+        monkeypatch.setattr(common, "require_mlp_sync", lambda on=on: on, raising=False)
+        reasons = k3._model_disable_reasons(model, K3, {})
+        assert reasons == (["mlp-sync padding is on"] if on else []), reasons
+
+
 def test_a_covered_layer_passes(monkeypatch):
     assert _reasons(monkeypatch, _fake_layer()) == []
     assert _reasons(monkeypatch, _fake_layer(kda=True)) == []
