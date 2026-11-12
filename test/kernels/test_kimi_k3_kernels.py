@@ -46,6 +46,12 @@ class TestMonoKimiK3Kernels(CustomTestCase):
     def test_layer_launch(self):
         self._check("check_k2", "--replays", "50")
 
+    def test_layer_launch_fp8_o_proj(self):
+        # SGLang's Quark FP8 o_proj, in both of the layouts it may store it in
+        for fmt in ("fp8", "fp8-shuffled"):
+            with self.subTest(o_proj=fmt):
+                self._check("check_k2", "--replays", "10", "--o-proj", fmt)
+
     def test_moe_launch(self):
         self._check("check_moe")
 

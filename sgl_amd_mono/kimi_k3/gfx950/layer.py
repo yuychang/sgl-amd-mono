@@ -123,6 +123,7 @@ class K2Build(msgspec.Struct, frozen=True):
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
     opt: int = 0  # the OPT_* bits
+    ofmt: int = k2a.O_BF16  # o_proj's weight format; see stages.oproj.O_BF16
 
 
 def peer_layout(s):
@@ -310,12 +311,14 @@ def build(key: K2Build):
         f"_t{int(key.timeline)}"
         + ("_f1" if key.fold else "")
         + (f"_o{key.opt}" if key.opt else "")
+        + (f"_w{key.ofmt}" if key.ofmt != k2a.O_BF16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
         core: Int64,
         w_o: Int64,
+        w_os: Int64,
         prefix: Int64,
         prefix_in: Int64,
         blocks: Int64,
@@ -410,6 +413,7 @@ def build(key: K2Build):
                 "ln_eps": key.ln_eps,
                 "xp": key.xp,
                 "guint": key.guint,
+                "ofmt": key.ofmt,
                 "lazy_inter": True,
                 "put": mb.put,
                 "put_bf": mb.put_bf,
@@ -444,6 +448,7 @@ def build(key: K2Build):
                 "args": {
                     "core": core,
                     "w_o": w_o,
+                    "w_os": w_os,
                     "prefix": prefix,
                     "prefix_in": prefix_in,
                     "blocks": blocks,
@@ -601,6 +606,7 @@ def build(key: K2Build):
     def launch(
         core: Int64,
         w_o: Int64,
+        w_os: Int64,
         prefix: Int64,
         prefix_in: Int64,
         blocks: Int64,
@@ -633,6 +639,7 @@ def build(key: K2Build):
         k2(
             core,
             w_o,
+            w_os,
             prefix,
             prefix_in,
             blocks,
@@ -701,15 +708,29 @@ def k2_launch(
     layer,
     tl=None,
     prefix_in=None,
+    w_os=None,
 ):
     """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
     place (read from ``prefix_in`` when given), ``out`` the MoE output [S, 7168]
-    (plus the updated prefix under ``key.fold``); MoE weights as ``moe``."""
+    (plus the updated prefix under ``key.fold``); MoE weights as ``moe``. ``w_o``
+    is o_proj's [7168, 1536] storage in ``key.ofmt``, and ``w_os`` its fp32 scale
+    a row when that is FP8."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
+        and w_o.is_contiguous()
         and core.is_contiguous()
         and prefix.is_contiguous()
     )
+    if key.ofmt == k2a.O_BF16:
+        assert w_o.dtype == torch.bfloat16 and w_os is None
+    else:
+        assert w_o.dtype == torch.float8_e4m3fn, w_o.dtype
+        assert (
+            w_os is not None
+            and w_os.dtype == torch.float32
+            and w_os.numel() == HIDDEN
+            and w_os.is_contiguous()
+        )
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
     assert SENT_READY or not key.opt & OPT_SENTS, "OPT_SENTS without init_peer"
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (
@@ -719,6 +740,7 @@ def k2_launch(
     f(
         core.data_ptr(),
         w_o.data_ptr(),
+        ptr(w_os),
         prefix.data_ptr(),
         (prefix if prefix_in is None else prefix_in).data_ptr(),
         blocks.data_ptr(),

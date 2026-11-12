@@ -32,7 +32,11 @@ SGLANG_READS = {
         "Feature",
         "Numerics",
     ),
-    "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration", "_qkvgbfa_layer"),
+    "srt/models/kimi_k3.py": (
+        "KimiK31ForConditionalGeneration",
+        "_qkvgbfa_layer",
+        "o_proj",
+    ),
     "srt/runtime_context.py": ("get_parallel",),
 }
 
@@ -75,7 +79,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Kimi-K3's per-layer checks, and what the wide launch reads on top: every
-    KDA layer's merged in_proj."""
+    KDA layer's merged in_proj, and its in_proj and o_proj weights as bf16."""
     reasons = k3._model_disable_reasons(model, hf_config, copies)
     layers = k3._backbone(model).layers
     covered = [i for i, layer in enumerate(layers) if wide._is_covered(layer)]
@@ -88,6 +92,22 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     ]
     if unmerged:
         reasons.append(f"layers {unmerged}: the KDA in_proj is not merged")
+    # Kimi-K3's checks take a Quark FP8 o_proj and in-projection (K1 and the layer
+    # launch read them); the wide launch reads both as bf16 only.
+    not_bf16 = [
+        i
+        for i in covered
+        if i not in unmerged
+        and (
+            layers[i].self_attn._qkvgbfa_layer.weight.dtype != torch.bfloat16
+            or layers[i].self_attn.o_proj.weight.dtype != torch.bfloat16
+        )
+    ]
+    if not_bf16:
+        reasons.append(
+            f"layers {not_bf16}: the KDA in_proj or o_proj is not bf16, which the "
+            "wide launch reads"
+        )
     return reasons
 
 

@@ -52,10 +52,13 @@ def _kda_slices(built, packed):
     st = built._k1_state
     mi = packed.k1.mamba_idx
     row = st["row"]
-    pairs = [
-        ("ssm", st.get("inter_ssm"), (mi, row)),
-        ("window", st.get("inter_window"), (mi, row)),
-    ]
+    if st.get("ring") is not None:
+        # ReplaySSM writes no state; its ring rows are what the commit replays
+        names = ("ring_k", "ring_v", "ring_g", "ring_b")
+        pairs = [(n, t, (mi, st["slot"])) for n, t in zip(names, st["ring"])]
+    else:
+        pairs = [("ssm", st.get("inter_ssm"), (mi, row))]
+    pairs.append(("window", st.get("inter_window"), (mi, row)))
     return [(n, t, idx) for n, t, idx in pairs if t is not None]
 
 
@@ -90,6 +93,8 @@ def reference(built, layer, packed, hidden, bank, forward_batch, zero_allocator)
             # the draft's input while leaving the layer's own output right.
             row = bank.block_residual[:, saved_nvb, :].clone()
         return {
+            # an FP8 in-projection is scored on its own bounds (spec.NUMERICS)
+            "launch": "k1" if packed.k1.key.wfmt == 0 else "k1_fp8",
             "core": core.detach().clone(),
             "row": row,
             "nvb": saved_nvb,
@@ -127,8 +132,8 @@ def compare(built, i: int, core: torch.Tensor, ref, bank) -> None:
         got, want = t[idx], ref["state"][name]
         if got.shape == want.shape:
             outputs[name] = (got, want)
-    _report(i, outputs)
-    built._check_handoff.append((i, ref["slices"], ref["state"]))
+    _report(i, outputs, ref["launch"])
+    built._check_handoff.append((i, ref["slices"], ref["state"], ref["launch"]))
 
 
 def compare_handoff(built) -> None:
@@ -140,13 +145,13 @@ def compare_handoff(built) -> None:
     pending = getattr(built, "_check_handoff", None)
     if not pending:
         return
-    for i, slices, want in pending:
+    for i, slices, want, launch in pending:
         for name, t, idx in slices:
             if name != "window":
                 continue
             got = t[idx]
             if got.shape == want[name].shape:
-                _report(i, {"window": (got, want[name])})
+                _report(i, {"window": (got, want[name])}, launch)
     built._check_handoff = []
 
 
@@ -157,7 +162,9 @@ def _profile(t: torch.Tensor, keep: int) -> str:
     return ",".join(f"{v:.6g}" for v in norms.tolist())
 
 
-def _profile_lines(name: str, got: torch.Tensor, want: torch.Tensor) -> list:
+def _profile_lines(
+    launch: str, name: str, got: torch.Tensor, want: torch.Tensor
+) -> list:
     """Where inside the output the two differ. Built for a violation only.
 
     The metrics say an output is wrong. They do not say which part of it is,
@@ -172,16 +179,18 @@ def _profile_lines(name: str, got: torch.Tensor, want: torch.Tensor) -> list:
         return []
     # [1, tokens, ...] for a pool slice, [tokens, ...] for core and bank
     tok = 1 if got.dim() >= 4 else 0
-    lines = [f"k1.{name} by_token got {_profile(got, tok)} want {_profile(want, tok)}"]
+    lines = [
+        f"{launch}.{name} by_token got {_profile(got, tok)} want {_profile(want, tok)}"
+    ]
     if name == "window":
         lines.append(
-            f"k1.{name} by_col got {_profile(got, tok + 1)} "
+            f"{launch}.{name} by_col got {_profile(got, tok + 1)} "
             f"want {_profile(want, tok + 1)}"
         )
     return lines
 
 
-def _report(i: int, outputs: dict) -> None:
+def _report(i: int, outputs: dict, launch: str) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.spec import NUMERICS
@@ -189,7 +198,7 @@ def _report(i: int, outputs: dict) -> None:
     if not outputs or get_parallel().tp_rank != 0:
         return
     values = {
-        f"k1.{out}.{metric}": v
+        f"{launch}.{out}.{metric}": v
         for out, (got, want) in outputs.items()
         for metric, v in _metrics(got, want).items()
     }
@@ -215,5 +224,5 @@ def _report(i: int, outputs: dict) -> None:
             missed.add(name.split(".")[1])
     # Once an output, however many of its metrics missed.
     for out in sorted(missed):
-        for line in _profile_lines(out, *outputs[out]):
+        for line in _profile_lines(launch, out, *outputs[out]):
             logger.error("monokernel check violation: layer %d %s", i, line)

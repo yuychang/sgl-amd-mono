@@ -118,7 +118,7 @@ def test_max_blocks_matches_the_reference_config():
     assert -(-last // block) + int(last % block == 0) == MAX_BLOCKS
 
 
-def _fake_layer(*, gate=True, kda=False):
+def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384):
     """A covered layer as model_disable_reasons reads it, everything passing."""
     import torch
 
@@ -128,14 +128,15 @@ def _fake_layer(*, gate=True, kda=False):
         )
 
     attn = SimpleNamespace(
-        o_proj=lin(HF_CONFIG["hidden_size"], 1536),
+        o_proj=o_proj or lin(HF_CONFIG["hidden_size"], 1536),
         forward_pre_o_proj=lambda **kw: None,
     )
     if not kda:  # only the MLA layers carry the gate
         attn.use_output_gate = gate
+    e, lat = HF_CONFIG["num_experts"], HF_CONFIG["routed_expert_hidden_size"]
     experts = SimpleNamespace(
-        w13_weight=SimpleNamespace(is_shuffled=True),
-        w2_weight=SimpleNamespace(is_shuffled=True),
+        w13_weight=SimpleNamespace(is_shuffled=True, shape=(e, 2 * ri, lat // 2)),
+        w2_weight=SimpleNamespace(is_shuffled=True, shape=(e, lat, ri // 2)),
     )
     up = SimpleNamespace(
         weight=torch.zeros(HF_CONFIG["hidden_size"], 8, dtype=torch.bfloat16)
@@ -165,6 +166,22 @@ def _reasons(monkeypatch, layer):
     return k3._model_disable_reasons(model, K3, {})
 
 
+def test_require_mlp_sync_is_read_from_utils_common_on_an_older_sglang(monkeypatch):
+    # Before sgl-project/sglang#48781 SGLang defines it in srt/utils/common.py and
+    # not in dp_attention; the checks must still run there, and still refuse.
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.utils import common
+
+    monkeypatch.delattr(dp_attention, "require_mlp_sync", raising=False)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers={i: _fake_layer() for i in range(93)})
+    )
+    for on in (False, True):
+        monkeypatch.setattr(common, "require_mlp_sync", lambda on=on: on, raising=False)
+        reasons = k3._model_disable_reasons(model, K3, {})
+        assert reasons == (["mlp-sync padding is on"] if on else []), reasons
+
+
 def test_a_covered_layer_passes(monkeypatch):
     assert _reasons(monkeypatch, _fake_layer()) == []
     assert _reasons(monkeypatch, _fake_layer(kda=True)) == []
@@ -175,6 +192,132 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     # so it cannot carry this: for MLA the split rides on the gate's wrapper.
     reasons = _reasons(monkeypatch, _fake_layer(gate=False))
     assert any("output gate" in r for r in reasons), reasons
+
+
+def _fp8_o_proj(*, quark=True):
+    """o_proj as SGLang leaves a Quark per-channel FP8 one: the [out, in]
+    storage transposed for its GEMM, an fp32 scale a row."""
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    hidden = HF_CONFIG["hidden_size"]
+    scheme = QuarkW8A8Fp8(
+        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+    )
+    return SimpleNamespace(
+        weight=torch.zeros(hidden, 1536, dtype=torch.float8_e4m3fn).t(),
+        weight_scale=torch.ones(hidden, 1, dtype=torch.float32),
+        scheme=scheme if quark else object(),
+        bias=None,
+    )
+
+
+def test_a_quark_fp8_o_proj_passes(monkeypatch):
+    assert _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj())) == []
+
+
+def test_an_fp8_o_proj_outside_quark_is_refused(monkeypatch):
+    reasons = _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj(quark=False)))
+    assert any("Quark per-channel FP8" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize("shuffled", [True, False])
+def test_the_fp8_o_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffled):
+    # SGLang preshuffles the FP8 weight exactly when its own predicate says so;
+    # the launch must read the same layout, or it reads the bytes in a wrong order.
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: shuffled)
+    fmt, storage, scale = k3._o_proj_operands(_fp8_o_proj())
+    assert fmt == (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8)
+    assert storage.is_contiguous() and tuple(storage.shape) == (
+        HF_CONFIG["hidden_size"],
+        1536,
+    )
+    assert tuple(scale.shape) == (HF_CONFIG["hidden_size"],)
+
+
+@pytest.mark.parametrize("shuffled", [True, False])
+def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffled):
+    # SGLang's merged Quark FP8 KDA in-projection is fused_qkvg_proj's own weight,
+    # padded to 6336 rows, with f_b kept as a bf16 copy. K1 must read the layout
+    # SGLang stored, and that copy of f_b rather than the FP8 f_b_proj.
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: shuffled)
+    rows = 6336
+    attn = SimpleNamespace(
+        use_full_rank_gate=True,
+        _qkvgbfa_in_qkvg_proj=True,
+        fused_qkvg_proj=SimpleNamespace(
+            weight=torch.zeros(rows, kda.HIDDEN, dtype=torch.float8_e4m3fn).t(),
+            weight_scale=torch.ones(rows, 1, dtype=torch.float32),
+            scheme=QuarkW8A8Fp8(
+                {"qscheme": "per_channel"},
+                {"qscheme": "per_channel", "is_dynamic": True},
+            ),
+        ),
+        _bfa_f_b_w=torch.zeros(kda.PROJ, kda.HD, dtype=torch.bfloat16),
+    )
+    fmt, w_in, scale, w_fb = k1._in_proj_operands(attn)
+    assert fmt == (kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8)
+    assert tuple(w_in.shape) == (rows, kda.HIDDEN) and w_in.is_contiguous()
+    assert tuple(scale.shape) == (rows,)
+    assert w_fb is attn._bfa_f_b_w
+
+
+def test_k1_builds_for_replayssm_and_a_bf16_state(monkeypatch):
+    # The AgentX recipe's KDA state: --mamba-ssm-dtype bfloat16 and the ReplaySSM
+    # ring. Each picks a launch variant; only a state dtype K1 has none for is
+    # refused.
+    import sglang.srt.runtime_context as runtime_context
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    mamba = SimpleNamespace(
+        mamba_ssm_dtype="bfloat16",
+        enable_linear_replayssm_spec=True,
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
+    )
+    assert k1._state_config() == (True, [])
+    assert k1._ring_mode()
+    mamba.mamba_ssm_dtype, mamba.enable_linear_replayssm_spec = "float32", False
+    assert k1._state_config() == (False, [])
+    assert not k1._ring_mode()
+    mamba.mamba_ssm_dtype = "float16"
+    assert "float32 or bfloat16" in k1._state_config()[1][0]
+
+
+def test_padded_experts_are_refused(monkeypatch):
+    # Without SGLANG_OPT_HIP_K3_AITER the intermediate is padded to 512.
+    reasons = _reasons(monkeypatch, _fake_layer(ri=512))
+    assert any("padded intermediate" in r for r in reasons), reasons
+
+
+def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
+    # AITER_SITUV2_A4W4's preshuffle is byte for byte the launch's gate_up=False one.
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
+    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    reasons = k3._config_disable_reasons(None, K3)
+    assert not any("interleaved" in r or "K3_AITER" in r for r in reasons), reasons
+
+
+def test_the_k3_aiter_switch_is_read_under_its_new_name(monkeypatch):
+    monkeypatch.delenv("SGLANG_AITER_K3_OPT", raising=False)
+    monkeypatch.delenv("SGLANG_OPT_HIP_K3_AITER", raising=False)
+    assert any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
+    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    assert not any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
 
 
 def test_the_guard_flags_sit_past_every_width(monkeypatch):

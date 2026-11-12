@@ -31,6 +31,13 @@ indexes the recurrent state with, and that number is a row of SGLang's scratch,
 not of this buffer. The buffer is expanded to a zero slot stride so every such
 number folds onto its single row. That is what makes one request work and what
 makes two impossible, so ``covered()`` refuses a batch above one.
+
+**Two ways to hand the recurrence back.** Without ReplaySSM, K1 writes the state
+after each token into ``intermediate_ssm`` and SGLang commits the accepted one.
+With ``--enable-linear-replayssm-spec`` there is no such scratch: K1 reads the
+committed state, writes none, and stores each token's raw k / v, log-decay gate
+and beta into the request's ring, which SGLang's commit replays. Either way the
+state is in ``--mamba-ssm-dtype``, fp32 or bf16.
 """
 
 from __future__ import annotations
@@ -136,8 +143,15 @@ SGLANG_READS = {
         "replayssm_rawk",
         "replayssm_g",
         "replayssm_beta",
+        # the request-scoped ring, which prepare() declines
+        "replayssm_request_ring",
     ),
     "srt/runtime_context.py": ("get_exec",),
+    # the server configuration K1's state handling rules out
+    "srt/arg_groups/fields/exec_.py": (
+        "enable_linear_replayssm_spec",
+        "mamba_ssm_dtype",
+    ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
@@ -145,6 +159,9 @@ SGLANG_READS = {
     "srt/models/kimi_k3.py": (
         "use_full_rank_gate",
         "_qkvgbfa_layer",
+        "_qkvgbfa_in_qkvg_proj",
+        "fused_qkvg_proj",
+        "_bfa_f_b_w",
         "qkv_conv1d",
         "f_b_proj",
         "A_log",
@@ -168,6 +185,11 @@ class K1Layer(msgspec.Struct):
     on_w: Any  # o_norm's weight as the kernel reads it, cast once
     conv: Any  # a row of K1Batch.conv, not an allocation of its own
     mamba_idx: int  # this layer's index into the KDA state pools
+    # the in-projection's storage, its FP8 scale (None for bf16) and f_b, as
+    # _in_proj_operands found them
+    w_in: Any = None
+    w_ins: Any = None
+    w_fb: Any = None
 
 
 class K1Batch(msgspec.Struct):
@@ -196,29 +218,92 @@ def _is_kda_layer(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d")
 
 
+def _state_config():
+    """(``--mamba-ssm-dtype`` is bf16, the reasons the configuration rules K1
+    out for every KDA layer at once)."""
+    from sglang.srt.runtime_context import get_exec
+
+    try:
+        mamba = get_exec().mamba
+    except ValueError:  # not published: no server, nothing to rule out
+        return False, []
+    reasons = []
+    dtype = mamba.mamba_ssm_dtype
+    if dtype not in (None, "float32", "bfloat16", torch.float32, torch.bfloat16):
+        reasons.append(
+            f"the recurrent state is {dtype} (--mamba-ssm-dtype); K1 takes "
+            "float32 or bfloat16"
+        )
+    return dtype in ("bfloat16", torch.bfloat16), reasons
+
+
+def _in_proj_operands(attn):
+    """The in-projection and f_b as the launch reads them: (``kda.W_*`` format,
+    the [rows, HIDDEN] storage, its fp32 scale a row or None, f_b [PROJ, HD]).
+    Raises ValueError naming what does not fit.
+
+    Either is the merged [q,k,v,g | f_a | b | pad] buffer. A bf16 one is the
+    ``_qkvgbfa_layer`` view SGLang builds when a monokernel backend is selected.
+    A Quark FP8 one is fused_qkvg_proj's own weight, into which SGLang wrote the
+    [f_a | b] rows and their scales, padded to a multiple of 64 rows; f_b then
+    comes from the bf16 copy SGLang keeps for its fused decode.
+    """
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
+
+    if not getattr(attn, "use_full_rank_gate", False):
+        raise ValueError(
+            "the KDA gate is not full-rank, so there is no wide projection to "
+            "extend (linear_attn_config.use_full_rank_gate)"
+        )
+    if getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
+        shuffled, w_in, scale = _quark_fp8_storage(
+            attn.fused_qkvg_proj, "KDA in-projection"
+        )
+        if w_in.shape[0] < kda.NPROJ or w_in.shape[1] != HIDDEN:
+            raise ValueError(
+                f"the FP8 KDA in-projection is {tuple(w_in.shape)}, not "
+                f"[>= {kda.NPROJ}, {HIDDEN}]"
+            )
+        fmt = kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8
+        w_fb = getattr(attn, "_bfa_f_b_w", None)
+    else:
+        merged = getattr(attn, "_qkvgbfa_layer", None)
+        if merged is None:
+            raise ValueError(
+                "the KDA in-projection is not merged "
+                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, or attention weights this "
+                "merge may not concatenate)"
+            )
+        w_in, scale, fmt = merged.weight, None, kda.W_BF16
+        if not (
+            w_in.dtype == torch.bfloat16
+            and tuple(w_in.shape) == (kda.NPROJ, HIDDEN)
+            and w_in.is_contiguous()
+        ):
+            raise ValueError(
+                f"the merged KDA in-projection is {w_in.dtype} {tuple(w_in.shape)}, "
+                f"not a contiguous bf16 [{kda.NPROJ}, {HIDDEN}]"
+            )
+        w_fb = attn.f_b_proj.weight
+    if not (
+        isinstance(w_fb, torch.Tensor)
+        and w_fb.dtype == torch.bfloat16
+        and tuple(w_fb.shape) == (kda.PROJ, kda.HD)
+        and w_fb.is_contiguous()
+    ):
+        raise ValueError(f"f_b is not a contiguous bf16 [{kda.PROJ}, {kda.HD}]")
+    return fmt, w_in, scale, w_fb
+
+
 def _unsupported_reasons(layer) -> list[str]:
     """Why K1 cannot take this layer, fail-loud at build rather than per step."""
     attn = layer.self_attn
     reasons = []
-    # w_in is the merged [q,k,v,g | f_a | b | pad] buffer. Without the merge
-    # there is no single tensor in K1's in-projection layout, and the pieces
-    # carry their own quantization scales that a row-cat would drop.
-    #
-    # A quantized checkpoint is not a reason on its own. SGLang takes the merge
-    # whenever a monokernel backend is selected, and Kimi-K3's checkpoint
-    # quantizes only its experts. What is left is the gate, the environment
-    # variable, and attention weights the merge may not concatenate.
-    if not getattr(attn, "use_full_rank_gate", False):
-        reasons.append(
-            "the KDA gate is not full-rank, so there is no wide projection to "
-            "extend (linear_attn_config.use_full_rank_gate)"
-        )
-    elif getattr(attn, "_qkvgbfa_layer", None) is None:
-        reasons.append(
-            "the KDA in-projection is not merged "
-            "(SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0, or attention weights this "
-            "merge may not concatenate)"
-        )
+    try:
+        _in_proj_operands(attn)
+    except ValueError as e:
+        reasons.append(str(e))
     conv = getattr(attn, "qkv_conv1d", None)
     if conv is None or conv.weight.dim() != 3 or conv.weight.shape[1] != 1:
         shape = None if conv is None else tuple(conv.weight.shape)
@@ -242,13 +327,15 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
 
     if not _is_kda_layer(layer):
         return None  # a full-attention layer, not a refusal
-    reasons = _unsupported_reasons(layer)
+    state_bf16, reasons = _state_config()
+    reasons += _unsupported_reasons(layer)
     if reasons:
         # Said once: a KDA layer K1 could not take is a configuration fact the
         # log has to carry, or K1 reads as built and unhelpful.
         _say(f"not built for the KDA layers: {'; '.join(reasons)}")
         return None
     attn = layer.self_attn
+    wfmt, w_in, w_ins, w_fb = _in_proj_operands(attn)
     return K1Layer(
         i=i,
         key=kda.KdaPreBuild(
@@ -266,8 +353,13 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
             # K1 reads the initial state from the committed pool, so the step
             # stages no copy of it (the ring reads the committed state itself)
             init_committed=not _ring_mode(),
+            wfmt=wfmt,
+            state_bf16=state_bf16,
         ),
         module=layer,
+        w_in=w_in,
+        w_ins=w_ins,
+        w_fb=w_fb,
         # The same cast SGLang's own fused KDA decode makes once at load
         # (kimi_k3.py _prepare_fused_decode); a step must not repeat it.
         on_w=attn.o_norm.weight.data.to(torch.bfloat16).contiguous(),
@@ -330,8 +422,9 @@ def _weight_args(packed: K1Layer) -> dict:
         "ares_nw": packed.module.self_attention_res_norm.weight,
         "ares_qk": packed.module.self_attention_res_proj.weight.view(HIDDEN),
         "in_nw": packed.module.input_layernorm.weight,
-        "w_in": attn._qkvgbfa_layer.weight,
-        "w_fb": attn.f_b_proj.weight,
+        "w_in": packed.w_in,
+        "w_in_scale": packed.w_ins,
+        "w_fb": packed.w_fb,
         "conv_w": attn.qkv_conv1d.weight.squeeze(1),
         "a_log": attn.A_log.detach().reshape(-1),
         "dt_bias": attn.dt_bias,
@@ -365,6 +458,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         f"bank has {blocks.shape[1]}"
     )
     rows, device = packed.key.qlen, runner.device
+    sdt = torch.bfloat16 if packed.key.state_bf16 else torch.float32
     ring, slots = None, rows
     if packed.key.ring:
         slots = 1
@@ -384,9 +478,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         delta=None,
         blocks=blocks,
         **_weight_args(packed),
-        rstate=torch.zeros(
-            slots, kda.NH, kda.HD, kda.HD, dtype=torch.float32, device=device
-        ),
+        rstate=torch.zeros(slots, kda.NH, kda.HD, kda.HD, dtype=sdt, device=device),
         st_idx=(
             torch.zeros(1, rows, dtype=torch.int32, device=device)
             if ring is not None
@@ -397,7 +489,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         # an init_committed build reads its initial state from these: a stand-in
         # pool slot 0 (a null pointer here faults the warmup at address 0)
         rstate0=(
-            torch.zeros(1, kda.NH, kda.HD, kda.HD, dtype=torch.float32, device=device)
+            torch.zeros(1, kda.NH, kda.HD, kda.HD, dtype=sdt, device=device)
             if packed.key.init_committed
             else None
         ),
@@ -444,6 +536,11 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     windows = getattr(cache, "intermediate_conv_window", None)
     ring = getattr(cache, "replayssm_rawv", None) is not None and inter_ssm is None
     if (inter_ssm is None and not ring) or not windows:
+        return None
+    if ring and getattr(pool.mamba_pool, "replayssm_request_ring", False):
+        # Host-only checkpoints (sgl-project/sglang#44718) index the ring by
+        # request, not by the slot K1 stores at.
+        _say("declined: the ReplaySSM ring is request-scoped")
         return None
     if batch.idx is None:
         # First call, which is an eager warmup forward: the pool indices and
@@ -547,10 +644,14 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
     qlen = st["num_draft"]
     key = batch.layers[0].key
     ring = st["ring"]
+    sdt = torch.bfloat16 if key.state_bf16 else torch.float32
     if ring is None:
         state_ok = (
-            st["inter_ssm"].dtype == torch.float32 and st["inter_ssm"].shape[2] == qlen,
-            f"intermediate_ssm is {st['inter_ssm'].dtype} {tuple(st['inter_ssm'].shape)}",
+            st["inter_ssm"].dtype == sdt
+            and st["inter_ssm"].shape[2] == qlen
+            and st["committed_ssm"].dtype == sdt,
+            f"intermediate_ssm is {st['inter_ssm'].dtype} {tuple(st['inter_ssm'].shape)}, "
+            f"the committed state {st['committed_ssm'].dtype}; built for {sdt}",
         )
     else:
         rk, rv, rg, rb = ring
@@ -558,9 +659,9 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
             rk.dtype == rv.dtype == torch.bfloat16
             and rg.dtype == rb.dtype == torch.float32
             and rk.shape[3] >= qlen
-            and st["committed_ssm"].dtype == torch.float32,
+            and st["committed_ssm"].dtype == sdt,
             f"the ReplaySSM ring is k {rk.dtype} {tuple(rk.shape)}, g {rg.dtype}, "
-            f"state {st['committed_ssm'].dtype}",
+            f"state {st['committed_ssm'].dtype}; built for {sdt}",
         )
     checks = [
         (st["rows"].numel() >= 1 and st["slots"].numel() >= 1, "the step has no state"),
