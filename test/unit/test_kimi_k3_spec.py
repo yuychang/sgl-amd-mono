@@ -307,16 +307,20 @@ def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
     # AITER_SITUV2_A4W4's preshuffle is byte for byte the launch's gate_up=False one.
     monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
     monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
-    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
     reasons = k3._config_disable_reasons(None, K3)
     assert not any("interleaved" in r or "K3_AITER" in r for r in reasons), reasons
 
 
-def test_the_k3_aiter_switch_is_read_under_its_new_name(monkeypatch):
+def test_the_k3_aiter_switch_is_read_under_either_name(monkeypatch):
+    from sglang.srt.environ import envs
+
+    field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
+    name = "SGLANG_OPT_HIP_K3_AITER" if field is not None else "SGLANG_AITER_K3_OPT"
     monkeypatch.delenv("SGLANG_AITER_K3_OPT", raising=False)
     monkeypatch.delenv("SGLANG_OPT_HIP_K3_AITER", raising=False)
     assert any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
-    monkeypatch.setenv("SGLANG_OPT_HIP_K3_AITER", "1")
+    monkeypatch.setenv(name, "1")
     assert not any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
 
 
