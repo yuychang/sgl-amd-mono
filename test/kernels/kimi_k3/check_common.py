@@ -5,6 +5,7 @@ the MoE reference SGLang's unfused decode path computes.
 Adapted from the Kimi-K3 mono decode tests in SGLang (test/registered/amd).
 """
 
+import os
 import sys
 
 import torch
@@ -156,8 +157,10 @@ def moe_reference(x, w, rank):
 
 def setup(port_offset: int = 0):
     """This rank's device and the gloo group the peer handshake needs."""
-    import os
-
+    # The launch quantizes the latent and SiTUv2 output to MXFP4. Current aiter
+    # defaults SiTUv2 to bf16 activations, so pin its A4W4 reference.
+    os.environ["AITER_SITUV2_A4W4"] = "1"
+    os.environ["AITER_SITUV2_A8W4"] = "0"
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")

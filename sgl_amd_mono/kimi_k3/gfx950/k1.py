@@ -159,7 +159,6 @@ SGLANG_READS = {
     "srt/models/kimi_k3.py": (
         "use_full_rank_gate",
         "_qkvgbfa_layer",
-        "_qkvgbfa_in_qkvg_proj",
         "fused_qkvg_proj",
         "_bfa_f_b_w",
         "qkv_conv1d",

@@ -106,9 +106,9 @@ SGLANG_READS = {
     ),
     # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
-    # the K3 AITER switch the expert layout depends on; its pre-rename name
-    # is read where the field does not exist yet
-    "srt/environ.py": ("envs", "SGLANG_OPT_HIP_K3_AITER"),
+    # the K3 AITER switch the expert layout depends on; its renamed Envs field
+    # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
+    "srt/environ.py": ("envs",),
     # a Quark per-channel FP8 o_proj, and whether SGLang preshuffled it
     "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
         "QuarkW8A8Fp8",
