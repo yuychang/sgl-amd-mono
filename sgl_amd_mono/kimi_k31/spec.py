@@ -2,7 +2,7 @@
 """Kimi-K3.1 on gfx950: the monokernel spec (RFC #43949).
 
 A routed step is a speculative verify step (DSpark or DFLASH) of L draft tokens a
-request (L = 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
+request (L = 5, 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
 layers, the MLA projection front on the DSA layers and the layer launch (o_proj to
 the MoE output) on every MoE layer. A step of R >= 2 requests runs
 ``wide.Wide.backbone``: one persistent launch a KDA layer, SGLang's routed experts
@@ -142,7 +142,14 @@ def _build(model, hf_config, ctx):
     p = get_parallel()
     device = k3._backbone(model).layers[0].input_layernorm.weight.device
     m0 = mem()
-    w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device, L=wide.tokens())
+    w = wide.Wide(
+        model,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        device,
+        L=wide.tokens(),
+        max_rows=max(ctx.widths),
+    )
     m1 = mem()
     w.warmup()
     m2 = mem()
@@ -162,8 +169,11 @@ SPEC = msgspec.structs.replace(
             widths=k3.SPEC.devices["gfx950"].widths + wide.wide_widths(),
         )
     },
-    # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV, which run on SGLang's path
-    features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
+    # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV, which run on SGLang's path.
+    # KV offload (HiCache) moves KV pages and KDA states between the host tier and the
+    # device pools between steps; a launch reads the device state pool by the step's
+    # slots, and the pool's tensors are the ones its tables were built on.
+    features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD},
     requires=msgspec.structs.replace(
         k3.SPEC.requires,
         attention_backends=frozenset({"dsa"}),
