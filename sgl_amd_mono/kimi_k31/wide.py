@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wide-row verify steps (R requests x L rows, R >= 2, L = the server's draft tokens,
-6 or 8) on the layer launch (``gfx950/layer.py``), eager v0.
+5, 6 or 8) on the layer launch (``gfx950/layer.py``), eager v0.
 
 A step walks the layers as SGLang's backbone does, except for every run of covered
 layers (KDA attention + latent MoE: all but layer 0, which has a dense MLP, and the
@@ -90,15 +90,14 @@ SGLANG_READS = {
 }
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
-REQ_BUCKETS = (
-    2,
-    4,
-    8,
-    16,
-    32,
-    48,
-)  # requests a bucket holds; its rows are L x requests
-SUPPORTED_L = (6, 8)
+# requests a tuned config (CFGS) is for
+TUNED_REQS = (2, 4, 8, 16, 32, 48)
+# requests a bucket holds; its rows are L x requests. A step runs the smallest bucket
+# that holds it and pays for the bucket's padded rows, and the launch's sort serves
+# only a step that fills its bucket: every count to 8, every second to 32, every
+# fourth to 56 (SGLang's speculative decode graph ladder to 32, then its step of 4).
+REQ_BUCKETS = (*range(2, 9), *range(10, 33, 2), *range(36, 57, 4))
+SUPPORTED_L = (5, 6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
 CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
     # bucket of the same requests takes the same configs
@@ -171,14 +170,22 @@ def req_buckets() -> tuple:
     return tuple(sorted(int(x) // 8 for x in env.split(","))) if env else REQ_BUCKETS
 
 
-def buckets(L: int = 8) -> tuple:
-    return tuple(L * r for r in req_buckets())
+def buckets(L: int = 8, max_rows: int | None = None) -> tuple:
+    """The L-token buckets; with ``max_rows``, only up to the one that holds it."""
+    bs = tuple(L * r for r in req_buckets())
+    if max_rows is None:
+        return bs
+    top = next((b for b in bs if b >= max_rows), bs[-1])
+    return tuple(b for b in bs if b <= top)
 
 
 def cfg_rows(b: int, L: int) -> str:
-    """The CFGS entry of an L-token bucket of b rows."""
+    """The configs of an L-token bucket of b rows: the CFGS entry of its requests, or
+    of the next tuned count above them (the largest one past it); a row override
+    names the bucket's own rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
-    up, inp, oproj, front, sdown = CFGS[8 * (b // L)]
+    tuned = next((r for r in TUNED_REQS if r >= b // L), TUNED_REQS[-1])
+    up, inp, oproj, front, sdown = CFGS[8 * tuned]
     return (
         UP_ROWS.get(b, up),
         INP_ROWS.get(b, inp),
@@ -188,7 +195,7 @@ def cfg_rows(b: int, L: int) -> str:
     )
 
 
-def wide_widths(max_reqs: int = 48) -> tuple:
+def wide_widths(max_reqs: int = REQ_BUCKETS[-1]) -> tuple:
     # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
     # up to a bucket left out below the smallest one stay on SGLang's own path. The
     # server's draft tokens are not known at import: every supported L's widths (the
@@ -203,8 +210,8 @@ def wide_widths(max_reqs: int = 48) -> tuple:
         if L * r > NARROW
     }
     # the binding serves a width at every L it is a multiple of: drop one another L
-    # reads as more requests than the largest bucket holds (8-token 312 .. 384 rows
-    # would be 52 .. 64 requests at 6 tokens)
+    # reads as more requests than the largest bucket holds (8-token 320 rows would be
+    # 64 requests at 5 tokens, 6-token 300 rows 60)
     return tuple(
         sorted(
             w for w in widths if all(w // L <= top for L in SUPPORTED_L if w % L == 0)
@@ -475,7 +482,7 @@ def _tail_fusable(layer) -> bool:
 
 
 class Wide:
-    def __init__(self, model, rank, group, device, L=8):
+    def __init__(self, model, rank, group, device, L=8, max_rows=None):
         from sgl_amd_mono.common import guard
 
         assert L in SUPPORTED_L, L
@@ -502,7 +509,8 @@ class Wide:
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
-        self.buckets = buckets(L)
+        # only the buckets this server's steps reach: each holds buffers and compiles
+        self.buckets = buckets(L, max_rows)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
