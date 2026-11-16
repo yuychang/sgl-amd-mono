@@ -223,6 +223,8 @@ def main():
         )
 
     fails, seen, first = [], {}, {}
+    # an FP8 o_proj's prefix and seam are scored on their own bounds (spec.NUMERICS)
+    seam = "k2" if args.o_proj == "bf16" else "k2_fp8"
     for tag, reset in (("accumulate", False), ("reset", True)):
         epoch[0].add_(1)
         out, prefix, key = run(
@@ -244,8 +246,8 @@ def main():
         checks = {
             "finite": bool(torch.isfinite(out).all()),
             "ranks agree": all(torch.equal(gathered[0], g) for g in gathered[1:]),
-            "prefix": cos(prefix, ref_prefix) > NUMERICS.bound("k2.prefix.cosine"),
-            "x": cos(xrow, ref_x) > NUMERICS.bound("k2.x.cosine"),
+            "prefix": cos(prefix, ref_prefix) > NUMERICS.bound(f"{seam}.prefix.cosine"),
+            "x": cos(xrow, ref_x) > NUMERICS.bound(f"{seam}.x.cosine"),
             "out": cos(out, ref_moe) > NUMERICS.bound("k2.out.cosine")
             and rel(out, ref_moe) < NUMERICS.bound("k2.out.rel"),
         }

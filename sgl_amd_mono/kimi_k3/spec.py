@@ -475,6 +475,15 @@ NUMERICS = Numerics(
         "k2.prefix.cosine": 1.0 - 1e-7,
         # The seam: slice, gate, mix, then the FFN input norm. Also exact.
         "k2.x.cosine": 1.0 - 1e-7,
+        # The same two on a Quark FP8 o_proj (check_k2 --o-proj fp8*). Not exact:
+        # the launch widens the weight to bf16 and sums in MFMA order, SGLang's
+        # FP8 GEMM quantizes the activation, and no reference sums in the
+        # launch's order, so a sum near a bf16 rounding boundary can land one ulp
+        # apart. Measured on 8x MI355X: prefix 1 - 1.19e-7 accumulating (one fp32
+        # ulp of the cosine), exactly 1 resetting. A wrong scale or row costs
+        # far more than the bound allows.
+        "k2_fp8.prefix.cosine": 1.0 - 1e-6,
+        "k2_fp8.x.cosine": 1.0 - 1e-6,
         # The layer output: the MoE on top of the seam. The expert sums land in
         # another order, so this is bf16 rounding, not exact.
         "k2.out.cosine": 0.99999,
