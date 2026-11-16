@@ -295,19 +295,19 @@ def _in_proj_operands(attn):
     return fmt, w_in, scale, w_fb
 
 
-def _unsupported_reasons(layer) -> list[str]:
-    """Why K1 cannot take this layer, fail-loud at build rather than per step."""
-    attn = layer.self_attn
-    reasons = []
+def _unsupported_reasons(attn):
+    """(the in-projection's operands or None, why K1 cannot take this layer):
+    fail-loud at build rather than per step."""
+    operands, reasons = None, []
     try:
-        _in_proj_operands(attn)
+        operands = _in_proj_operands(attn)
     except ValueError as e:
         reasons.append(str(e))
     conv = getattr(attn, "qkv_conv1d", None)
     if conv is None or conv.weight.dim() != 3 or conv.weight.shape[1] != 1:
         shape = None if conv is None else tuple(conv.weight.shape)
         reasons.append(f"the KDA conv weight is {shape}, not [channels, 1, width]")
-    return reasons
+    return operands, reasons
 
 
 def _ring_mode() -> bool:
@@ -326,15 +326,16 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
 
     if not _is_kda_layer(layer):
         return None  # a full-attention layer, not a refusal
+    attn = layer.self_attn
     state_bf16, reasons = _state_config()
-    reasons += _unsupported_reasons(layer)
+    operands, layer_reasons = _unsupported_reasons(attn)
+    reasons += layer_reasons
     if reasons:
         # Said once: a KDA layer K1 could not take is a configuration fact the
         # log has to carry, or K1 reads as built and unhelpful.
         _say(f"not built for the KDA layers: {'; '.join(reasons)}")
         return None
-    attn = layer.self_attn
-    wfmt, w_in, w_ins, w_fb = _in_proj_operands(attn)
+    wfmt, w_in, w_ins, w_fb = operands
     return K1Layer(
         i=i,
         key=kda.KdaPreBuild(
@@ -457,7 +458,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         f"bank has {blocks.shape[1]}"
     )
     rows, device = packed.key.qlen, runner.device
-    sdt = torch.bfloat16 if packed.key.state_bf16 else torch.float32
+    sdt = kda.state_dtype(packed.key)
     ring, slots = None, rows
     if packed.key.ring:
         slots = 1
@@ -643,7 +644,7 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
     qlen = st["num_draft"]
     key = batch.layers[0].key
     ring = st["ring"]
-    sdt = torch.bfloat16 if key.state_bf16 else torch.float32
+    sdt = kda.state_dtype(key)
     if ring is None:
         state_ok = (
             st["inter_ssm"].dtype == sdt

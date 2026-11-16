@@ -44,6 +44,7 @@ from sgl_amd_mono.kimi_k3 import MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, NA
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
     slice_loads,
@@ -717,20 +718,10 @@ def k2_launch(
     a row when that is FP8."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
-        and w_o.is_contiguous()
         and core.is_contiguous()
         and prefix.is_contiguous()
     )
-    if key.ofmt == k2a.O_BF16:
-        assert w_o.dtype == torch.bfloat16 and w_os is None
-    else:
-        assert w_o.dtype == torch.float8_e4m3fn, w_o.dtype
-        assert (
-            w_os is not None
-            and w_os.dtype == torch.float32
-            and w_os.numel() == HIDDEN
-            and w_os.is_contiguous()
-        )
+    wfmt.check(key.ofmt, w_o, w_os, HIDDEN, k2a.OK)
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
     assert SENT_READY or not key.opt & OPT_SENTS, "OPT_SENTS without init_peer"
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (

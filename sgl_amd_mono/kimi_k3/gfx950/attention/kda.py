@@ -41,7 +41,6 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
     butterfly,
-    fp8_to_bf16x8,
     hw_exp2,
     hw_rsq,
     ld_i32,
@@ -60,6 +59,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     COLS,
     GSL,
@@ -104,11 +104,10 @@ PER_WAVE = NKCH // WAVES  # 7
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
-# in_proj's weight formats (``key.wfmt``), as stages.oproj's o_proj ones: bf16
-# [NPROJ, HIDDEN]; a per-channel FP8 one with an fp32 scale a row, row-major or
-# in AITER's (16, 16) preshuffle, of at least NPROJ rows (SGLang pads its merged
-# Quark FP8 in-proj to a multiple of 64 rows, which is what it preshuffles)
-W_BF16, W_FP8, W_FP8_SHUFFLED = 0, 1, 2
+# in_proj's weight formats (``key.wfmt``), [NPROJ, HIDDEN]: see stages.wfmt. An
+# FP8 one may have more rows (SGLang pads its merged Quark FP8 in-proj to a
+# multiple of 64 rows, which is what it preshuffles).
+W_BF16, W_FP8, W_FP8_SHUFFLED = wfmt.BF16, wfmt.FP8, wfmt.FP8_SHUFFLED
 # timeline points: start, slice, gate, mix, load_x, gemv0, gemv1, k.stage,
 # k.conv, k.gates, k.recur, k.norm
 TL_POINTS = 15
@@ -146,6 +145,11 @@ class KdaPreBuild:
     # the recurrent state rows (rstate, rstate0), read and written, are bf16
     # (--mamba-ssm-dtype bfloat16)
     state_bf16: bool = False
+
+
+def state_dtype(key: KdaPreBuild) -> torch.dtype:
+    """The recurrent state's dtype (rstate, rstate0, SGLang's pools)."""
+    return torch.bfloat16 if key.state_bf16 else torch.float32
 
 
 def scratch_layout(key: KdaPreBuild) -> dict:
@@ -192,9 +196,17 @@ def gemv_loads(c, rg, chunks):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
     (indices into wave, wave + 8, ..): a lane 64 contiguous bytes of its row a
     chunk (4 dwordx4). ``rg`` past the last group loads the last group."""
-    if c["wfmt"] != W_BF16:
-        return gemv_loads_fp8(c, rg, chunks)
     lane, wave = c["lane"], c["wave"]
+    if c["wfmt"] != W_BF16:
+        return wfmt.fp8_loads(
+            c["args"]["w_in"],
+            c["wfmt"],
+            lane,
+            rg,
+            (wave + WAVES * i for i in chunks),
+            HIDDEN,
+            rg_max=GEMV_TASKS - 1,
+        )
     r_w = rsrc(c["args"]["w_in"])
     row = fx.min(rg, GEMV_TASKS - 1) * ROWS + lane % ROWS
     g = lane // ROWS
@@ -217,51 +229,6 @@ def gemv_loads(c, rg, chunks):
             ]
         )
     return out
-
-
-def w_fp8_byte(c, rg, ch, q):
-    """The byte of a lane's 8 FP8 elements (row 16 rg + lane % 16, k = 128 ch +
-    32 q + 8 g): the bf16 load's elements. AITER's (16, 16) preshuffle of a
-    byte weight [N, K] is [N / 16][K / 32][2][16 rows][16 B], as for o_proj."""
-    lane = c["lane"]
-    r, g = lane % ROWS, lane // ROWS
-    if c["wfmt"] == W_FP8_SHUFFLED:
-        tile = rg * (HIDDEN // 32) + ch * 4 + q
-        return tile * 512 + (g // 2) * 256 + r * 16 + (g % 2) * 8
-    return (rg * ROWS + r) * HIDDEN + ch * KCH + q * 32 + g * 8
-
-
-def gemv_loads_fp8(c, rg, chunks):
-    """``gemv_loads`` for an FP8 in_proj: per chunk and q, the lane's two dwords."""
-    wave = c["wave"]
-    r_w = rsrc(c["args"]["w_in"])
-    rgc = fx.min(rg, GEMV_TASKS - 1)
-    out = []
-    for i in chunks:
-        ch = wave + WAVES * i
-        out.append(
-            [
-                fx.Vector(
-                    bo.buffer_load(
-                        r_w,
-                        w_fp8_byte(c, rgc, ch, q) // 4,
-                        vec_width=2,
-                        dtype=T.i32,
-                        cache_modifier=CM_NT,
-                    )
-                )
-                for q in range(4)
-            ]
-        )
-    return out
-
-
-def w_operand(c, w):
-    """A lane's 8 in_proj values as the MFMA's bf16 operand. E4M3 widens to
-    bf16 exactly, so an FP8 weight loses nothing here."""
-    if c["wfmt"] == W_BF16:
-        return w.bitcast(fx.BFloat16)
-    return fp8_to_bf16x8(w[0], w[1])
 
 
 def w_scaled(c, rg, r, v):
@@ -312,7 +279,9 @@ def stage_gemv(c, rg, ops):
                     result_type=fx.Vector.make_type(4, fx.Int32),
                 )
             )
-            acc = mfma_bf16(w_operand(c, ops[i][q]), xb.bitcast(fx.BFloat16), acc)
+            acc = mfma_bf16(
+                wfmt.operand(c["wfmt"], ops[i][q]), xb.bitcast(fx.BFloat16), acc
+            )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if (tid < ROWS * s) & (rg < GEMV_TASKS):
@@ -1005,21 +974,8 @@ def kda_pre(
             f"the block-write row is {key.write_idx}, past a bank of "
             f"{blocks.size(1)} rows {tuple(blocks.shape)}"
         )
-    if key.wfmt == W_BF16:
-        assert w_in.shape == (NPROJ, HIDDEN) and w_in.dtype == torch.bfloat16
-        assert w_in_scale is None
-    else:
-        assert w_in.dtype == torch.float8_e4m3fn, w_in.dtype
-        assert w_in.shape[0] >= NPROJ and w_in.shape[1] == HIDDEN
-        assert key.wfmt != W_FP8_SHUFFLED or w_in.shape[0] % ROWS == 0
-        assert (
-            w_in_scale is not None
-            and w_in_scale.dtype == torch.float32
-            and w_in_scale.numel() == w_in.shape[0]
-            and w_in_scale.is_contiguous()
-        )
-    assert w_in.is_contiguous()
-    want = torch.bfloat16 if key.state_bf16 else torch.float32
+    wfmt.check(key.wfmt, w_in, w_in_scale, NPROJ, HIDDEN)
+    want = state_dtype(key)
     assert rstate.dtype == want and rstate[0].numel() == NH * HD * HD, rstate.dtype
     assert rstate[0].is_contiguous(), (
         "a slot's state must be dense; slots may be strided"
