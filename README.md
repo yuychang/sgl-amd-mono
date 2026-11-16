@@ -327,7 +327,8 @@ pytest test/kernels -k qwen35_a17b_fp8                          # 1 x MI355X, no
 pytest test/e2e -k qwen35_a17b_fp8                              # MI355X, QWEN35_FP8_MODEL_PATH set; QWEN35_FP8_TP=4 (default) or 8 for decode, MTP at TP4
 pytest test/kernels test/e2e -k qwen38_a95b_mxfp4               # 8 x MI355X, QWEN38_A95B_MXFP4_MODEL_PATH set: K1 on 1 GPU, K2 on 8, server at TP8
 pytest test/kernels test/e2e -k qwen38_flash_next               # 1 x MI355X, QWEN38_FLASH_NEXT_MODEL_PATH set (the kernel test needs no checkpoint)
-pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
+pytest test/kernels test/e2e -k "kimi_k3 and not quark"       # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
+pytest test/e2e -k kimi_k3_quark                                # 8 x MI355X, KIMI_K3_QUARK_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
 ```
 
 Kernel-only time of a DeepSeek-V4.1-Flash layer: `torchrun --nproc-per-node 4 test/kernels/deepseek_v41/time_layer.py --widths 6,12`.

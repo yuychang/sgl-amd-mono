@@ -36,6 +36,7 @@ CHECKPOINTS = [
         "amd/GLM-5.3-Quark-MXFP4-AttnFP8",
         "amd/GLM-5.3-Flash-Quark-MXFP4",
         "moonshotai/Kimi-K3",
+        "amd/Kimi-K3-Quark-MXFP4-AttnFP8",
         "RadixArk/Kimi-K3-DSpark",
         "moonshotai/Kimi-K3.1",
         "RadixArk/Kimi-K3.1-DFlash2",
@@ -317,6 +318,26 @@ MODELS = {
         # one request at a time, MMMU-Pro takes ~8 h and held a CI node for most of
         # the nightly; it runs in the weekly run only
         "weekly_evals": ["mmmu_pro"],
+        # the recipe runs one request a step (DSpark verify steps of 8 rows)
+        "concurrency": [1],
+        "gate_concurrency": [1],
+    },
+    # The Quark checkpoint: the launches' FP8 attention projections, with the bf16
+    # KDA state and the ReplaySSM ring (the AgentX c1 recipe). kimi_k3's entry
+    # runs the kernel tests.
+    "kimi_k3_quark": {
+        "name": "Kimi-K3 (Quark MXFP4, FP8 attention)",
+        "packages": ["kimi_k3"],
+        "tp": 8,
+        "paths": {
+            "KIMI_K3_QUARK_MODEL_PATH": f"{HF}/amd/Kimi-K3-Quark-MXFP4-AttnFP8",
+            "KIMI_K3_DSPARK_MODEL_PATH": f"{HF}/RadixArk/Kimi-K3-DSpark",
+        },
+        "recipe": ("kimi_k3_quark_server", "ARGS"),
+        "kernel_tests": [],
+        "e2e_tests": ["test/e2e/test_kimi_k3_quark_server.py"],
+        "microbench": [],
+        "evals": TEXT_EVALS,
         # the recipe runs one request a step (DSpark verify steps of 8 rows)
         "concurrency": [1],
         "gate_concurrency": [1],

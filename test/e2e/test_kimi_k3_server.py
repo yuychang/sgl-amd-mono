@@ -50,6 +50,9 @@ KL_BOUND = 0.03
 # The startup line that says the routing is live. The runtime serves whole
 # requests only, so DSpark's 8 tokens a request leave batch size 1.
 RUNS = "runs target_verify steps of batch size [1] x 8 tokens"
+# (model, env, args) of the server: kimi_k3_server's. test_kimi_k3_quark_server
+# runs the same checks on the Quark checkpoint's recipe.
+RECIPE = (MODEL, ENV, ARGS)
 
 
 def _gfx950_gpus() -> int:
@@ -60,13 +63,14 @@ def _gfx950_gpus() -> int:
     return torch.cuda.device_count()
 
 
-def _launch(extra_env=None, extra_args=(), log=None):
-    env = {**os.environ, **ENV, **(extra_env or {})}
+def _launch(recipe=RECIPE, extra_env=None, extra_args=(), log=None):
+    model, recipe_env, args = recipe
+    env = {**os.environ, **recipe_env, **(extra_env or {})}
     return popen_launch_server(
-        MODEL,
+        model,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
+        other_args=args + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
@@ -74,12 +78,16 @@ def _launch(extra_env=None, extra_args=(), log=None):
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 class TestMonokernelKimiK3(CustomTestCase):
+    recipe = RECIPE
+
     @classmethod
     def setUpClass(cls):
         cls.logs = tuple(
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
-        cls.process = _launch(extra_args=["--watchdog-timeout", "600"], log=cls.logs)
+        cls.process = _launch(
+            cls.recipe, extra_args=["--watchdog-timeout", "600"], log=cls.logs
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -119,10 +127,11 @@ class TestMonokernelKimiK3(CustomTestCase):
     def test_covered_steps_match_prefill(self):
         # The launch folds the residual add in, so a wrong seam is a silent
         # numerical error: only scoring the same tokens the other way finds it.
+        model = self.recipe[0]
         assert_logprobs_match(
             DEFAULT_URL_FOR_TEST,
-            {MODEL: {"kl_div": KL_BOUND}},
-            MODEL,
+            {model: {"kl_div": KL_BOUND}},
+            model,
             max_new_tokens=32,
             trust_remote_code=True,
         )
