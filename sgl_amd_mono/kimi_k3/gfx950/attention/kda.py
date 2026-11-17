@@ -864,6 +864,9 @@ def build(key: KdaPreBuild):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
+    from sgl_amd_mono.common.compiled_launch import compiled_launch
+
+    launch = compiled_launch(launch)
     _BUILDS[key] = launch
     return launch
 

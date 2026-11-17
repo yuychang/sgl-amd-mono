@@ -1000,6 +1000,9 @@ def kda_layer(
             sort_buf,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
+    from sgl_amd_mono.common.compiled_launch import compiled_launch
+
+    launch = compiled_launch(launch)
     _BUILDS[key] = (launch, pl)
     return launch, pl
 
