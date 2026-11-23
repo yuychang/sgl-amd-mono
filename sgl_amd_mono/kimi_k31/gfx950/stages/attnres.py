@@ -65,6 +65,7 @@ def attnres_row(
     bank_cm=0,
     emit_mixed=None,
     ldp=0,
+    emit_prefix=None,
 ):
     """One row: ``prefix`` [m, sl] (device scope, just written), ``bank`` [m, nbk, sl]
     (snapshots 0 .. nvb - 1), ``cw`` f32 [H], ``w_o`` bf16 [H]; ``c["xs_of"]`` /
@@ -73,8 +74,9 @@ def attnres_row(
     prefix becomes bank row nvb (device scope: a later seam of the launch may read
     it); ``bank_cm`` CM_DEV when an earlier seam of this launch wrote the bank.
     ``emit_mixed(q, live, vec)``: the pre-norm mixture (bf16), SGLang's
-    ``aggregate_stream`` -- what DSpark captures after the previous layer. ``ldp``: the
-    prefix's row stride (0: sl)."""
+    ``aggregate_stream``. ``emit_prefix(q, live, vec)``: the raw bf16 prefix
+    slice (what DSpark captures when ``aux_hidden_stream == "prefix"``). ``ldp``:
+    the prefix's row stride (0: sl)."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     rank = c["rank"]
@@ -107,6 +109,8 @@ def attnres_row(
             cache_modifier=CM_DEV,
         )
     )
+    if const_expr(emit_prefix is not None):
+        emit_prefix(q, live, pv)
     xs.append([x for e in range(4) for x in bf2_f32(pv[e])])
     cwv = [
         fx.Vector(

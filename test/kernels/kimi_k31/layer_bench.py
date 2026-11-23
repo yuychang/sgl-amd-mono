@@ -325,14 +325,17 @@ def run(args, m, rank, dev, cpu):
             prefix_l = prefix.clone()
             prefix_l[:, m - args.pfx_short :] = float("nan")
         bk = torch.randn(nl, m, nbk, H, generator=gb, device=dev).to(BF)
-        lat = lat_p.float()
-        dist.all_reduce(lat)
-        lat_n = F.rms_norm(lat.to(BF).float(), (LAT,), w_n.float(), 1e-5).to(BF)
-        sh = sh_p.float()
-        dist.all_reduce(sh)
-        mid = (
-            (sh + lat_n.float() @ w_up.float().T).to(BF).float() + prefix.float()
-        ).to(BF)
+        if args.no_t1:
+            mid = prefix
+        else:
+            lat = lat_p.float()
+            dist.all_reduce(lat)
+            lat_n = F.rms_norm(lat.to(BF).float(), (LAT,), w_n.float(), 1e-5).to(BF)
+            sh = sh_p.float()
+            dist.all_reduce(sh)
+            mid = (
+                (sh + lat_n.float() @ w_up.float().T).to(BF).float() + prefix.float()
+            ).to(BF)
         xa = attn_res_ref(mid, bk, nva, ln["sa"], wp["a"], ln["in"])
         ip = (xa.float() @ w_ip.float().T).to(BF)
         cr = torch.stack(
@@ -391,14 +394,22 @@ def run(args, m, rank, dev, cpu):
                     win=torch.stack(
                         [win_ref(ip[i], conv0, sc, ai, k1, L) for i in range(nl)]
                     ),
-                    cap=mixed_ref(mid, bk, nva, ln["sa"], wp["a"]),
+                    cap=(
+                        mid
+                        if cap == "prefix"
+                        else mixed_ref(mid, bk, nva, ln["sa"], wp["a"])
+                    ),
                 ),
                 ids=ids.sort(-1).values,
                 wts=wts.gather(-1, ids.sort(-1).indices),
             )
         )
     cur = {k: sets[0][k].clone() for k in ("lat_p", "sh_p", "prefix", "bank")}
-    mid = torch.zeros(nl, m, sl, dtype=BF, device=dev)
+    mid = (
+        sets[0]["ref"]["mid"].clone()
+        if args.no_t1
+        else torch.zeros(nl, m, sl, dtype=BF, device=dev)
+    )
     pout = torch.zeros(
         nl, m, H, dtype=BF, device=dev
     )  # the launch writes its columns of full rows
@@ -527,6 +538,8 @@ def run(args, m, rank, dev, cpu):
         s = sets[r % SETS]
         for k in cur:
             cur[k].copy_(s[k])
+        if args.no_t1:
+            mid.copy_(s["ref"]["mid"])
         conv.copy_(conv0.unsqueeze(0).expand_as(conv))
         graph.replay()
         for k, got in (
@@ -550,6 +563,13 @@ def run(args, m, rank, dev, cpu):
         )  # the unused row
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
+            if cap == "prefix":
+                # prefix capture emits the kernel's own mid slice unchanged (bit-exact)
+                mid_parts = [torch.empty_like(mid) for _ in range(TP)]
+                dist.all_gather(mid_parts, mid.contiguous())
+                mid_full = torch.cat(mid_parts, dim=-1)
+                if not torch.equal(cap_view, mid_full):
+                    worst["cap"] = 9.0
             others = torch.cat(
                 [aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1
             )
@@ -608,29 +628,31 @@ def run(args, m, rank, dev, cpu):
             worst["w_own"],
             worst["cap"],
             worst["win"],
+            float(sort_bad),
         ],
         device=dev,
     )
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
+    e = torch.stack(every).max(0).values.tolist()
+    # end to end a top-16 flips where the 16th / 17th keys are closer than the
+    # upstream rounding; the routing itself must match on its own logits exactly
+    # restart: h is the attention output alone (no prefix), so it carries core's error undiluted
+    rs = args.restart
+    ok = (
+        e[0] < 1e-2
+        and e[1] < (3e-2 if rs else 1e-2)
+        and e[2] < 3e-2
+        and e[3] < 3e-2
+        and e[4] < 3e-2
+        and e[5] < (2e-3 if rs else 1e-3)
+        and e[8] == 0
+        and e[9] < 1e-5
+        and e[10] < 1e-2
+        and e[11] < 1e-2
+        and e[12] == 0
+    )
     if rank == 0:
-        e = torch.stack(every).max(0).values.tolist()
-        # end to end a top-16 flips where the 16th / 17th keys are closer than the
-        # upstream rounding; the routing itself must match on its own logits exactly
-        # restart: h is the attention output alone (no prefix), so it carries core's error undiluted
-        rs = args.restart
-        ok = (
-            e[0] < 1e-2
-            and e[1] < (3e-2 if rs else 1e-2)
-            and e[2] < 3e-2
-            and e[3] < 3e-2
-            and e[4] < 3e-2
-            and e[5] < (2e-3 if rs else 1e-3)
-            and e[8] == 0
-            and e[9] < 1e-5
-            and e[10] < 1e-2
-            and e[11] < 1e-2
-        )
         print(
             f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
             f"{e[2]:.2e} windows {e[11]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
@@ -644,6 +666,7 @@ def run(args, m, rank, dev, cpu):
     dist.barrier()
     peers.close()
     dist.barrier()
+    return ok
 
 
 def main():
@@ -660,7 +683,12 @@ def main():
     p.add_argument("--reps-check", type=int, default=6)
     p.add_argument("--plan", action="store_true")
     p.add_argument(
-        "--capture", action="store_true", help="DSpark capture of the previous layer"
+        "--capture",
+        nargs="?",
+        const="attn_res",
+        default=False,
+        choices=("attn_res", "prefix"),
+        help="DSpark capture of the previous layer (attn_res or prefix)",
     )
     p.add_argument(
         "--no-t1", action="store_true", help="no MoE tail (a run's first layer)"
@@ -717,9 +745,11 @@ def main():
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
     dev = torch.device("cuda", rank)
+    all_ok = True
     for m in (int(v) for v in args.rows.split(",")):
-        run(args, m, rank, dev, cpu)
+        all_ok &= bool(run(args, m, rank, dev, cpu))
     dist.destroy_process_group()
+    raise SystemExit(0 if all_ok else 1)
 
 
 if __name__ == "__main__":

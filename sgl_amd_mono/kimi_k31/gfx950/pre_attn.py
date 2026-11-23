@@ -533,11 +533,14 @@ def _seam(
                     cache_modifier=CM_SYS,
                 )
 
+    cap_mode = "attn_res" if capture is True else (capture or None)
+    assert cap_mode in (None, "attn_res", "prefix"), capture
     emit_mixed = None
-    if const_expr(capture):
+    emit_prefix = None
+    if const_expr(cap_mode is not None):
         caps = [c["cap_of"](p) for p in range(TP)]
 
-        def emit_mixed(q, live, vec):
+        def _emit_cap(q, live, vec):
             if live:
                 for p in range_constexpr(TP):
                     bo.buffer_store(
@@ -546,6 +549,11 @@ def _seam(
                         (row * H + rank * SL + 8 * q) // 2,
                         cache_modifier=CM_SYS,
                     )
+
+        if const_expr(cap_mode == "prefix"):
+            emit_prefix = _emit_cap
+        else:
+            emit_mixed = _emit_cap
 
     attnres_row(
         c,
@@ -565,13 +573,15 @@ def _seam(
         write,
         0,
         emit_mixed,
+        0,
+        emit_prefix,
     )
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     coll.put_each_peer(
         c,
         [("agf", rank * m + row, fx.Int32(1))]
-        + ([("capf", rank * m + row, fx.Int32(1))] if capture else []),
+        + ([("capf", rank * m + row, fx.Int32(1))] if cap_mode is not None else []),
     )
 
 

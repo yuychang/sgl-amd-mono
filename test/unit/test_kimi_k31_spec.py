@@ -90,3 +90,23 @@ def test_an_unmerged_in_proj_is_reported_once(monkeypatch):
     # an unmerged layer has no merged weight to read; it is refused for that alone
     reasons = _reasons(monkeypatch, in_proj=None, o_proj=torch.float8_e4m3fn)
     assert reasons == ["layers [0]: the KDA in_proj is not merged"], reasons
+
+
+def test_wide_capture_stream_and_variant():
+    assert wide._capture_stream(SimpleNamespace()) == "attn_res"
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="attn_res"))
+        == "attn_res"
+    )
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="prefix"))
+        == "prefix"
+    )
+    with pytest.raises(ValueError, match="unsupported dspark_aux_hidden_stream"):
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="unknown"))
+
+    pk = SimpleNamespace(i=76, nvb=7, write=False, t1=True)
+    w = object.__new__(wide.Wide)
+    assert w._variant(pk, 48, 6, {75}, "prefix")["capture"] == "prefix"
+    assert w._variant(pk, 48, 6, {75}, "attn_res")["capture"] == "attn_res"
+    assert w._variant(pk, 48, 6, {79}, "prefix")["capture"] is False

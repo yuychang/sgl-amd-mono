@@ -186,8 +186,9 @@ def kda_layer(
     [m, H] (the shared partial the next layer's MoE tail reads)), cnt (every tile
     counter, zeroed once), scratch, peers, rank, epoch, slot. linbf merges, the
     front in f32 (router logits). ``capture``: DSpark's capture of the previous
-    layer (the attention seam's pre-norm mixture, gathered) -> cap_out [m, H] with
-    row stride cap_ld; else cap_out is unused. ``t1=False`` (check builds): no MoE tail;
+    layer -> cap_out [m, H] with row stride cap_ld (True / "attn_res": attention
+    seam's pre-norm mixture, gathered; "prefix": raw post-layer prefix ``mid``,
+    gathered; False: cap_out is unused). ``t1=False`` (check builds): no MoE tail;
     ``mid`` is an input (the prefix after the previous layer, written by the caller).
     ``restart``: a block-write layer -- its prefix restarts at the attention output
     (SGLang passes no prefix_sum there). ``logits_out`` f32 [m, 896]: the gathered
@@ -202,6 +203,8 @@ def kda_layer(
     # sort: False / None (off), True or "sgl" (SGLang's BM32 small sort + mxfp8 quant), "aux16" (aiter's BM16 aux sort)
     sort = ("sgl" if sort is True else sort) or None
     assert sort is None or sort in mf.SORT_KINDS, sort
+    capture = "attn_res" if capture is True else (capture or False)
+    assert capture in (False, "attn_res", "prefix"), capture
     keyed = key_tuple({**locals(), "front_rows": str(front_rows)}, SOURCES)
     key = (
         m,
@@ -343,9 +346,10 @@ def kda_layer(
     class Tls:
         v: fx.Array[fx.Int64, TL_POINTS, 16]
 
+    cap_tag = {False: "0", "attn_res": "1", "prefix": "p"}[capture]
     name = (
         f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
-        f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
+        f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{cap_tag}_t{int(t1)}_r{int(restart)}"
         + ("_tl" if timeline else "")
         + ("_fr" + "x".join(map(str, front_rows)) if front_rows else "")
         + ("_un" if up_norm else "")
@@ -902,7 +906,7 @@ def kda_layer(
                 )
             stamp(timeline, tls, tid, 12)
             # ---- DSpark capture of the previous layer
-            if const_expr(capture):
+            if const_expr(bool(capture)):
                 a = ka("cap_out", "cap_ld")
                 for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                     pre.capture_row(ca, row, m, a.cap_out, a.cap_ld)
