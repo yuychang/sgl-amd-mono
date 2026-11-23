@@ -144,6 +144,19 @@ def _build(model, hf_config, ctx):
     narrow = k3.SPEC.build(
         model, hf_config, msgspec.structs.replace(ctx, widths=narrow_widths)
     )
+    parallel = get_parallel()
+    device = k3._backbone(model).layers[0].input_layernorm.weight.device
+
+    from sgl_amd_mono.kimi_k31.xgmi import maybe_install_xgmi_hooks
+
+    maybe_install_xgmi_hooks(
+        model,
+        cpu_group=parallel.tp_group.cpu_group,
+        rank=parallel.tp_rank,
+        device=device,
+        log_fn=wide._say,
+    )
+
     if not any(w > wide.NARROW for w in ctx.widths):
         return narrow
 
@@ -159,13 +172,11 @@ def _build(model, hf_config, ctx):
             *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2])))
         )
 
-    p = get_parallel()
-    device = k3._backbone(model).layers[0].input_layernorm.weight.device
     m0 = mem()
     w = wide.Wide(
         model,
-        p.tp_rank,
-        p.tp_group.cpu_group,
+        parallel.tp_rank,
+        parallel.tp_group.cpu_group,
         device,
         L=wide.tokens(),
         max_rows=max(ctx.widths),
