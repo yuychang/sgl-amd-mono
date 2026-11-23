@@ -160,3 +160,102 @@ def test_install_xgmi_hooks_rebinds_bank_and_preserves_mla_gate():
     out, _ = proj.forward(torch.empty(256, 7168, dtype=torch.bfloat16))
     assert out is fake_qkv
     assert proj._xgmi_pre_qkv_a is None
+
+
+def test_overlapped_prefill_avoids_comm_stream_allocations(monkeypatch):
+    """Overlapped o_proj RS and normed allgather must allocate only on main_stream
+    and never call record_stream(comm_stream)."""
+    import contextlib
+
+    from sgl_amd_mono.kimi_k31.xgmi import hook as xgmi_hook
+    from sgl_amd_mono.kimi_k31.xgmi import prefill as xgmi_prefill
+
+    in_comm = {"flag": False}
+    events_log = []
+
+    class FakeStream:
+        def __init__(self, name: str):
+            self.name = name
+
+        def wait_stream(self, other):
+            events_log.append((self.name, "wait_stream", other.name))
+
+        def wait_event(self, ev):
+            events_log.append((self.name, "wait_event", ev.idx))
+
+    class FakeEvent:
+        def __init__(self, idx: int):
+            self.idx = idx
+
+        def record(self, stream):
+            events_log.append((stream.name, "record", self.idx))
+
+    main_s = FakeStream("main")
+    comm_s = FakeStream("comm")
+
+    @contextlib.contextmanager
+    def fake_stream_ctx(s):
+        prev = in_comm["flag"]
+        in_comm["flag"] = s is comm_s
+        try:
+            yield
+        finally:
+            in_comm["flag"] = prev
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **kw: main_s)
+    monkeypatch.setattr(torch.cuda, "stream", fake_stream_ctx)
+
+    def fake_rs(heap, partial, *, out_shard=None, out_col_off=0):
+        assert in_comm["flag"]
+        assert out_shard is not None
+        assert partial.is_contiguous()
+        return out_shard
+
+    monkeypatch.setattr(xgmi_prefill, "reduce_scatter_rows", fake_rs)
+
+    fake_heap = types.SimpleNamespace(
+        streams=types.SimpleNamespace(comm=comm_s),
+        chunk_events=[FakeEvent(i) for i in range(4)],
+    )
+    x = torch.empty(16, 32, dtype=torch.bfloat16)
+    w = torch.empty(64, 32, dtype=torch.bfloat16)
+    out = xgmi_prefill.overlapped_o_proj_rs(fake_heap, x, w, n_chunks=4)
+    assert out.shape == (2, 64)
+    assert ("main", "wait_stream", "comm") in events_log
+
+    seen_ag = {}
+
+    def fake_ag(heap, x_shard, *, out_all=None, tmp=None):
+        assert in_comm["flag"]
+        assert out_all is not None and x_shard.is_contiguous()
+        seen_ag["out_all"] = out_all
+        seen_ag["tmp"] = tmp
+        return out_all
+
+    monkeypatch.setattr(xgmi_hook, "row_allgather", fake_ag)
+    normed = torch.empty(1024, 7168, dtype=torch.bfloat16)
+    out_all, keep = xgmi_hook._gather_normed_all(
+        fake_heap, normed, need_normed_all=True, overlap_normed=True
+    )
+    assert out_all is seen_ag["out_all"]
+    assert out_all.shape == (1024 * TP, 7168)
+    assert seen_ag["tmp"] is not None
+    assert len(keep) == 2
+
+    # Fault injection: if row_allgather raises on comm_stream, main_stream must
+    # still wait for comm_stream before releasing the preallocated buffers.
+    events_log.clear()
+
+    def failing_ag(heap, x_shard, *, out_all=None, tmp=None):
+        raise RuntimeError("injected chunk failure")
+
+    monkeypatch.setattr(xgmi_hook, "row_allgather", failing_ag)
+    try:
+        xgmi_hook._gather_normed_all(
+            fake_heap, normed, need_normed_all=True, overlap_normed=True
+        )
+    except RuntimeError as exc:
+        assert "injected chunk failure" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert ("main", "wait_stream", "comm") in events_log

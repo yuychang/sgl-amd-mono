@@ -64,19 +64,26 @@ def overlapped_o_proj_rs(
     main_stream = torch.cuda.current_stream(hidden.device)
     comm_stream = heap.streams.comm
     events = heap.chunk_events
+    # Keep all chunk partials alive until wait_stream(comm_stream) so we never
+    # call record_stream(comm_stream) or allocate on comm_stream.
+    part_chunks: list[torch.Tensor] = []
 
-    for chunk_idx in range(n_chunks):
-        col_off = chunk_idx * chunk_cols
-        part_chunk = gemm(x_pad, o_proj_weight[col_off : col_off + chunk_cols])
-        events[chunk_idx].record(main_stream)
-        part_chunk.record_stream(comm_stream)
-        with torch.cuda.stream(comm_stream):
-            comm_stream.wait_event(events[chunk_idx])
-            reduce_scatter_rows(
-                heap, part_chunk, out_shard=out_shard, out_col_off=col_off
-            )
-
-    main_stream.wait_stream(comm_stream)
+    try:
+        for chunk_idx in range(n_chunks):
+            col_off = chunk_idx * chunk_cols
+            part_chunk = gemm(
+                x_pad, o_proj_weight[col_off : col_off + chunk_cols]
+            ).contiguous()
+            part_chunks.append(part_chunk)
+            events[chunk_idx].record(main_stream)
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(events[chunk_idx])
+                reduce_scatter_rows(
+                    heap, part_chunk, out_shard=out_shard, out_col_off=col_off
+                )
+    finally:
+        main_stream.wait_stream(comm_stream)
+        part_chunks.clear()
     return out_shard
 
 

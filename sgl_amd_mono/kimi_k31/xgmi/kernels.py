@@ -369,6 +369,7 @@ def row_allgather(
     x_shard: torch.Tensor,
     *,
     out_all: Optional[torch.Tensor] = None,
+    tmp: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     x_shard = x_shard.contiguous()
     rows, cols = x_shard.shape
@@ -389,7 +390,15 @@ def row_allgather(
             heap.deadline_s,
         )
         return out_all
-    tmp = x_shard.new_empty(max_rows_per_rank * TP, cols)
+    if tmp is None:
+        tmp = x_shard.new_empty(max_rows_per_rank * TP, cols)
+    else:
+        assert (
+            tmp.shape[0] >= max_rows_per_rank * TP
+            and tmp.shape[1] == cols
+            and tmp.dtype == x_shard.dtype
+            and tmp.is_contiguous()
+        ), (tuple(tmp.shape), tmp.dtype, max_rows_per_rank * TP, cols, x_shard.dtype)
     for row_start in range(0, rows, max_rows_per_rank):
         row_end = min(row_start + max_rows_per_rank, rows)
         sub_rows = row_end - row_start
