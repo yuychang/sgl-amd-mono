@@ -10,6 +10,7 @@ The fault test is not repeated; the guard does not depend on the checkpoint.
 """
 
 import unittest
+from pathlib import Path
 
 import test_kimi_k3_server as k3
 from kimi_k3_quark_server import ARGS, ENV, MODEL
@@ -17,6 +18,12 @@ from kimi_k3_quark_server import ARGS, ENV, MODEL
 
 class TestMonokernelKimiK3Quark(k3.TestMonokernelKimiK3):
     recipe = (MODEL, ENV, ARGS)
+
+    def test_the_tested_batches_run_the_monokernels(self):
+        super().test_the_tested_batches_run_the_monokernels()
+        log = "".join(Path(f.name).read_text() for f in self.logs)
+        self.assertIn("Kimi-K3 K1: engaged on a decode step", log)
+        self.assertNotIn("not built for the KDA layers", log)
 
 
 if __name__ == "__main__":

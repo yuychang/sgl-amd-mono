@@ -323,10 +323,11 @@ MODELS = {
         "gate_concurrency": [1],
     },
     # The Quark checkpoint: the launches' FP8 attention projections, with the bf16
-    # KDA state and the ReplaySSM ring (the AgentX c1 recipe). kimi_k3's entry
-    # runs the kernel tests.
+    # KDA state and the ReplaySSM ring (the AgentX c1 recipe). Deprecated Kimi-K3
+    # variant; kimi_k31 runs the shared K1/K2 kernel tests in PR CI.
     "kimi_k3_quark": {
         "name": "Kimi-K3 (Quark MXFP4, FP8 attention)",
+        "pr": False,
         "packages": ["kimi_k3"],
         "tp": 8,
         "paths": {
@@ -351,7 +352,11 @@ MODELS = {
         "tp": 8,
         # moonshotai/Kimi-K3.1; not on the CI nodes yet, and no serving recipe
         "paths": {},
-        "kernel_tests": ["test/kernels/test_kimi_k31_k1_ring.py"],
+        "kernel_tests": [
+            "test/kernels/test_kimi_k31_k1_ring.py",
+            "test/kernels/test_kimi_k3_k1.py",
+            "test/kernels/test_kimi_k3_kernels.py",
+        ],
         "e2e_tests": [],
         "microbench": [
             "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128"

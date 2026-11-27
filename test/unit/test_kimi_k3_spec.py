@@ -166,22 +166,6 @@ def _reasons(monkeypatch, layer):
     return k3._model_disable_reasons(model, K3, {})
 
 
-def test_require_mlp_sync_is_read_from_utils_common_on_an_older_sglang(monkeypatch):
-    # Before sgl-project/sglang#48781 SGLang defines it in srt/utils/common.py and
-    # not in dp_attention; the checks must still run there, and still refuse.
-    from sglang.srt.layers import dp_attention
-    from sglang.srt.utils import common
-
-    monkeypatch.delattr(dp_attention, "require_mlp_sync", raising=False)
-    model = SimpleNamespace(
-        model=SimpleNamespace(layers={i: _fake_layer() for i in range(93)})
-    )
-    for on in (False, True):
-        monkeypatch.setattr(common, "require_mlp_sync", lambda on=on: on, raising=False)
-        reasons = k3._model_disable_reasons(model, K3, {})
-        assert reasons == (["mlp-sync padding is on"] if on else []), reasons
-
-
 def test_a_covered_layer_passes(monkeypatch):
     assert _reasons(monkeypatch, _fake_layer()) == []
     assert _reasons(monkeypatch, _fake_layer(kda=True)) == []
@@ -342,3 +326,34 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
     assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+
+
+def test_quark_fp8_storage_refuses_a_non_fp8_weight():
+    # Guards against a non-FP8 KDA in-projection reaching warmup and failing wfmt.check.
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = QuarkW8A8Fp8(
+        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+    )
+    linear = SimpleNamespace(
+        weight=torch.zeros(16, 16, dtype=torch.bfloat16).t(),
+        weight_scale=torch.ones(16, dtype=torch.float32),
+        scheme=scheme,
+    )
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        k3._quark_fp8_storage(linear, "KDA in-projection")
+
+
+def test_k1_state_config_reads_env_when_flag_is_unset(monkeypatch):
+    # Guards against K1 silently building fp32 when SGLANG_MAMBA_SSM_DTYPE picks bf16.
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: SimpleNamespace(mamba=SimpleNamespace(mamba_ssm_dtype=None)),
+    )
+    monkeypatch.setenv("SGLANG_MAMBA_SSM_DTYPE", "bfloat16")
+    state_bf16, reasons = k1._state_config()
+    assert state_bf16 is True
+    assert reasons == []

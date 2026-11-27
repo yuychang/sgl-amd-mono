@@ -63,6 +63,8 @@ def _kda_slices(built, packed):
 
 
 def reference(built, layer, packed, hidden, bank, forward_batch, zero_allocator):
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
     """SGLang's own attention on this layer's input, with the caches put back.
 
     Runs before K1 on the same input. The stage's prepare() returns a new
@@ -94,7 +96,7 @@ def reference(built, layer, packed, hidden, bank, forward_batch, zero_allocator)
             row = bank.block_residual[:, saved_nvb, :].clone()
         return {
             # an FP8 in-projection is scored on its own bounds (spec.NUMERICS)
-            "launch": "k1" if packed.k1.key.wfmt == 0 else "k1_fp8",
+            "launch": "k1" if packed.k1.key.wfmt == kda.W_BF16 else "k1_fp8",
             "core": core.detach().clone(),
             "row": row,
             "nvb": saved_nvb,

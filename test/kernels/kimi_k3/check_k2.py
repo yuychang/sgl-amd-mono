@@ -14,7 +14,7 @@ with whatever it was given.
 ``--o-proj`` picks o_proj's format: bf16, or a per-channel FP8 one row-major
 (``fp8``) or in AITER's (16, 16) preshuffle (``fp8-shuffled``), the layout
 SGLang stores a Quark FP8 o_proj in for its GEMM. The FP8 reference multiplies
-the same E4M3 values in fp32 and scales each row, so the bound is the bf16 one.
+the same E4M3 values in fp32 and scales each row, scored on the k2_fp8.* bounds.
 
 Both prefix modes run. A plain layer accumulates into the prefix. A block-write
 layer restarts it at the attention output. The control at the end of the file

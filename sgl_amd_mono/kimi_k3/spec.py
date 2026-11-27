@@ -257,10 +257,12 @@ def _quark_fp8_storage(linear, name: str):
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
     storage = linear.weight.t()
+    if storage.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"the FP8 {name} is {storage.dtype}, not float8_e4m3fn")
     if storage.dim() != 2 or not storage.is_contiguous():
         raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
     rows = storage.shape[0]
-    scale = getattr(linear, "weight_scale", None)
+    scale = linear.weight_scale
     if not (
         isinstance(scale, torch.Tensor)
         and scale.dtype == torch.float32
@@ -524,6 +526,16 @@ NUMERICS = Numerics(
         # points down. Measured exact, so the bound is tight on purpose.
         "k1.window.cosine": 1.0 - 1e-6,
         "k1.window.rel": 0.001,
+        # ReplaySSM ring rows on a bf16 in-projection (unmeasured; ring_k/v share
+        # the window path while ring_g/b pass through the f_a/f_b/b GEMVs).
+        "k1.ring_k.cosine": 1.0 - 1e-6,
+        "k1.ring_k.rel": 0.001,
+        "k1.ring_v.cosine": 1.0 - 1e-6,
+        "k1.ring_v.rel": 0.001,
+        "k1.ring_g.cosine": 0.9999,
+        "k1.ring_g.rel": 0.005,
+        "k1.ring_b.cosine": 0.9999,
+        "k1.ring_b.rel": 0.005,
         # K1 on a Quark FP8 in-projection (k1_fp8), against the same check. SGLang
         # quantizes the projection's input to FP8 a token and K1 multiplies it
         # in bf16, so every output moves by that quantization, about 1%; the
@@ -550,6 +562,9 @@ NUMERICS = Numerics(
         "k1_fp8.ring_g.rel": 0.025,
         "k1_fp8.ring_b.cosine": 0.9999,
         "k1_fp8.ring_b.rel": 0.015,
+        # Unmeasured (non-ReplaySSM FP8 path); set conservatively from k1_fp8.core.
+        "k1_fp8.ssm.cosine": 0.999,
+        "k1_fp8.ssm.rel": 0.05,
     },
 )
 

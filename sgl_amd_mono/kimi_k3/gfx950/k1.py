@@ -228,6 +228,8 @@ def _state_config():
         return False, []
     reasons = []
     dtype = mamba.mamba_ssm_dtype
+    if dtype is None:
+        dtype = os.environ.get("SGLANG_MAMBA_SSM_DTYPE")
     if dtype not in (None, "float32", "bfloat16", torch.float32, torch.bfloat16):
         reasons.append(
             f"the recurrent state is {dtype} (--mamba-ssm-dtype); K1 takes "
@@ -265,13 +267,14 @@ def _in_proj_operands(attn):
                 f"[>= {kda.NPROJ}, {HIDDEN}]"
             )
         fmt = kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8
-        w_fb = getattr(attn, "_bfa_f_b_w", None)
+        w_fb = attn._bfa_f_b_w
     else:
         merged = getattr(attn, "_qkvgbfa_layer", None)
         if merged is None:
             raise ValueError(
                 "the KDA in-projection is not merged "
-                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, or attention weights this "
+                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0 / "
+                "SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0, or attention weights this "
                 "merge may not concatenate)"
             )
         w_in, scale, fmt = merged.weight, None, kda.W_BF16
@@ -537,7 +540,7 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     ring = getattr(cache, "replayssm_rawv", None) is not None and inter_ssm is None
     if (inter_ssm is None and not ring) or not windows:
         return None
-    if ring and getattr(pool.mamba_pool, "replayssm_request_ring", False):
+    if ring and pool.mamba_pool.replayssm_request_ring:
         # Host-only checkpoints (sgl-project/sglang#44718) index the ring by
         # request, not by the slot K1 stores at.
         _say("declined: the ReplaySSM ring is request-scoped")
